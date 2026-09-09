@@ -183,6 +183,8 @@ program_contracts[]:
 
 所有 mutation 都有身份、权限、结构验证、大小限制、审计和幂等语义。API schema 使用同一来源生成 TypeScript/Rust 客户端，内核格式仍由 Slate 定义。
 
+这些接口同样供 Clay 使用。Pebble 提前准备稳定项目/结果身份、权限查询和固定成果版本提交；写作编辑与实时协作由 Clay 实现。具体边界见 [Clay 接入准备](technical-research.md#clay-接入准备共用成果协议独立写作状态)。
+
 | 方法与路径 | 输入/响应核心 | 关键规则 |
 | --- | --- | --- |
 | `GET /api/v1/packages/{id}/versions` | 包版本、snapshot digest、撤回/撤销状态、ETag | 私有索引也鉴权，分页稳定排序 |
