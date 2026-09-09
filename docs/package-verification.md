@@ -2,6 +2,8 @@
 
 记录：TECH-0002；状态：proposed；研究日期：2026-09-08。
 
+当前核心方向：Cargo 式的本地包管理与构建检查，Pebble 提供注册分发、验证发布及 GitHub 风格的包浏览。完整 Git 托管不作为前置条件。
+
 本文件是可供下一步实现讨论的协议草案，不是现有 Slate 命令或已接受的持久格式。平台架构见 [技术研究](technical-research.md)。
 
 ## 1. 对当前 Slate 的实际核查
@@ -34,6 +36,33 @@ Cargo registry 区分版本元数据与下载内容，记录 checksum、依赖�
 
 ## 3. 三份独立的数据
 
+### 本地用户工作流：以 Cargo 的职责划分为参照
+
+Cargo 将命令划分为构建、清单、包、发布和报告等类别，并区分作者维护的依赖清单与工具生成的精确锁文件。这里借鉴职责和使用习惯，Slate 的证明语义仍由自己的工具链决定。[Cargo 命令](https://doc.rust-lang.org/cargo/commands/index.html)、[清单与锁文件](https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html)。
+
+以下命令均为待设计的包级接口；现有 `slatec check/run` 的单文件接口不等于这些能力已实现。最终命令前缀需在 Slate 仓库决定。
+
+| 建议操作 | 行为与边界 |
+| --- | --- |
+| `slate new / init` | 建立包清单、源码目录和 README；可选择 library 或 executable 用途 |
+| `slate add / remove` | 修改依赖意图并解析更新锁文件；不靠全局安装使 import 偶然成功 |
+| `slate fetch` | 按锁文件取得源码/数据；下载不自动运行用户构建脚本 |
+| `slate update [package]` | 显式重新求解允许更新的版本，展示依赖与检查身份变化 |
+| `slate build` | 根据精确工作区图构建产物，复用合法缓存；build 成功不等于所有程序都已证明正确 |
+| `slate check` | 执行所选包检查目标，输出覆盖范围、精确结果、假设和未解决项 |
+| `slate run` | 选择可执行目标并运行，保持现有 ordinary execution 与证明检查的区别 |
+| `slate package` | 检查清单、枚举将上传的文件、生成不可变快照；可离线预览包内容 |
+| `slate publish` | 上传同一快照，触发正式检查/审核，查询完成状态；可幂等重试 |
+| `slate search / info / tree / metadata` | 搜索包、查看版本与安装信息、解释依赖图、向 IDE/agent 输出结构化工作区 |
+
+`--locked` 禁止隐式改锁，缺锁或清单不一致直接失败；`--offline` 禁止网络，缺依赖明确报错；普通重复构建优先沿用已有锁，不自行追最新版。缓存可复用，但键需绑定源内容、依赖、工具链及相关检查配置。
+
+Workspace 支持多个成员共享一个求解结果及锁文件，并可选择检查一个成员或全部成员；不可达成员不进入单个包的数学依赖闭包。发布多包按依赖顺序准备，仍遵循第 4 节的精确环境限制。
+
+`test`、文档生成和类似 `cargo install` 的可执行工具安装需要分别定义目标模型，后续加入；有限输入测试通过不能冒充定理证明，当前不为了命令表完整而造假的验证状态。自动执行 build scripts、插件或可执行清单也不是采用 Cargo 风格所必需的功能。
+
+网页包详情页建议采用 GitHub 熟悉的布局：owner/name、README、源码树、版本、依赖、结果和侧栏安装命令。包版本是默认浏览基线，源码直接来自对应发布快照；无需先创建远程 Git 仓库才可发布、安装或浏览一个引理包。
+
 ### A. 作者清单：意图
 
 建议 `slate.toml` 作为本地包清单、`slate.lock` 作为生成的锁文件；名字与命令仍是提案。作者清单包含：
@@ -59,7 +88,7 @@ algebra = { package = "@example/algebra", version = "^0.2.0" }
 
 依赖 alias 仅供清单使用，不自动重命名 Slate 的 ModuleId。工具链选择由独立受控 toolchain descriptor 锁定，锁文件记录其摘要。理论文件与标准库也是精确内容依赖，不能从运行机器的任意安装位置取到“差不多一样”的版本。
 
-源码 roots 是作者提出的包边界，不是验证覆盖的最终依据。最终发布内容由服务器从固定 Git tree 枚举，所有形式化源码均进入工具链清单；作者少写一个 root、用 ignore 排除坏定理不能得到正式发布。未支持的形式化内容使发布候选保持未就绪，并列出文件。
+源码 roots 是作者提出的包边界，不是验证覆盖的最终依据。最终发布内容由服务器从上传的固定包快照枚举（如果从 Git 导入，则先固定 tree 并物化为同一种快照），所有形式化源码均进入工具链清单；作者少写一个 root、用 ignore 排除坏定理不能得到正式发布。未支持的形式化内容使发布候选保持未就绪，并列出文件。
 
 ### B. 发布输入清单：固定内容
 
@@ -158,7 +187,7 @@ program_contracts[]:
 | --- | --- | --- |
 | `GET /api/v1/packages/{id}/versions` | 包版本、snapshot digest、撤回/撤销状态、ETag | 私有索引也鉴权，分页稳定排序 |
 | `GET /api/v1/packages/{id}/versions/{version}` | 固定清单及当前状态引用 | 内容身份稳定；状态可以追加变化 |
-| `POST /api/v1/projects/{id}/release-candidates` | commit OID、包路径集合、expected project revision | 返回 202 + candidate ID；同幂等键换请求体返回 409 |
+| `POST /api/v1/projects/{id}/release-candidates` | snapshot digest、包集合、可选 Git 来源、expected project revision | 返回 202 + candidate ID；同幂等键换请求体返回 409 |
 | `GET /api/v1/release-candidates/{id}` | 当前阶段、检查与审核记录、失败原因 | 失败阶段可诊断，不把 Timeout 显示为 False |
 | `POST /api/v1/release-candidates/{id}/publish` | If-Match 候选修订、幂等键 | 检查输入不变且当前 gate 通过，事务提交全部包 |
 | `POST /api/v1/releases/{id}/withdrawals` | 原因、替代发布引用 | 原版本不覆写，记录调用者权限 |
