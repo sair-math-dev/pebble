@@ -114,6 +114,7 @@ Markdown/HTML 渲染清理不可信内容，不执行用户 MDX/JavaScript；附
 | `release_candidates`, `releases` | 固定修订、包集合、manifest digest、审核记录、状态修订 |
 | `verification_runs`, `verification_results` | input digest、工具链/政策、attempt、状态、报告对象；结果按精确声明绑定 |
 | `results`, `result_revisions` | 人类延续性 result ID；精确版本声明/命题/闭包身份；跨版本关联由作者提出并可审阅 |
+| `research_cards`, `contribution_attributions` | 版本绑定的问题/贡献说明、原结果作者、形式化者和维护者；区分作者陈述与工具链导出字段 |
 | `dependency_edges`, `citations` | 前者绑定包/模块/声明实际依赖；后者保存科学引用；不混成一种边 |
 | `issues`, `pull_requests`, `reviews`, `comments` | 固定审阅修订和目标对象，正文可编辑并留历史 |
 | `follows`, `bookmarks`, `activity_events`, `notifications` | 唯一关注关系、幂等事件 ID、每用户读取状态 |
@@ -173,7 +174,7 @@ BYOK 输出只在允许训练的来源规则下进入清单；没有权限信息
 1. **包工作区与 Slate adapter**：清单、锁文件、依赖图、真实构建/检查及完整结构化报告；与现有 CLI 的单文件选择准确衔接。
 2. **注册与分发**：账户/命名空间、上传包快照、不可变版本、依赖索引、下载和认证；包不依赖平台自托管 Git。
 3. **完整发布闭环**：本地 package/publish、隔离检查、基本审核和事务发布；第三台干净环境添加依赖并检查新结果。
-4. **GitHub 风格包页面**：README、源码树、版本、依赖、结果、安装命令和搜索；论文作为可选附件阅读/下载。
+4. **学术成果页面**：GitHub 风格导航下的研究卡、学术署名、独立结果页、条件筛选、精确引用、使用示例和直接复用列表；源码树、版本、依赖及安装命令配套，论文可阅读/下载。反向查询给 dependency_edges 的被依赖声明列建立索引，无需独立图数据库。
 5. **后续产品扩展**：关注、讨论、项目审阅与完整 Git 托管；再按需求推进竞赛、研究记录和训练导出。写作协作不在当前范围。
 
 要先测的高风险点：锁文件失效与依赖冲突、双 worker 回传、发布与撤权并发、上传论文与发布修订不一致、私有依赖泄漏、Slate 同名模块版本冲突。每项用能区分设计是否成立的实验，不用空壳 API 或模拟验证成功交差。
