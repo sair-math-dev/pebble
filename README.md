@@ -8,5 +8,7 @@ Pebble 围绕同一个研究项目连接写作、形式化代码、数据、包�
 
 - [产品与架构设计草案](docs/product-architecture.md)
 - [设计依据与需求映射](docs/requirements.md)
+- [技术研究与实现方案](docs/technical-research.md)
+- [Slate 包管理、验证与发布协议](docs/package-verification.md)
 
 本仓库承载 Pebble 平台。Slate 的编译器、可信内核和本地包管理客户端留在 Slate 仓库；双方通过明确的包与验证协议连接。
