@@ -1,205 +1,201 @@
+// The verification worker: for one candidate it rebuilds the publisher's
+// release-mode check inside bubblewrap with the real `slate` client and
+// `slatec`, against a `file://` mirror of the registry it materializes itself,
+// and compares what the compiler produced with what was uploaded.
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import {
-  canonical, digest, digestBytes, snapshotDigest, toolchainDigest, policyDigest,
-  validateBundle, type Bundle, type FileEntry, type Policy, type Toolchain,
+  compareInterfaces, digestBytes, encloses, levelAtLeast, parseInterface, parseManifest, policyDigest,
+  readArchive, toolchainDigest, validateInterfacePath, validatePackagePath, type Level, type Policy, type Toolchain,
 } from './protocol.js';
 import { loadToolchain } from './toolchain.js';
 import type { JobLease, JobResult, Registry } from './registry.js';
 
-export function verificationInputDigest(root: Bundle, dependencies: Bundle[], toolchain: string, policy: string): string {
-  return digest('Pebble.VerificationInput.v1', {
-    root_snapshot_digest: snapshotDigest(root.snapshot),
-    dependency_snapshots: dependencies.map(bundle => ({
-      package_id: bundle.snapshot.package_id, snapshot_digest: snapshotDigest(bundle.snapshot),
-    })).sort((a, b) => a.package_id.localeCompare(b.package_id)),
-    toolchain_digest: toolchain, policy_digest: policy,
-  });
-}
+const MIRROR_INDEX = 'file:///work/registry/index/';
 
-export function reportMatchesInput(value: unknown, expected: FileEntry[], policy: Policy): boolean {
-  if (!value || typeof value !== 'object') return false;
-  const report = value as Record<string, unknown>;
-  if (report.schema !== 'Slate.PackageCheckReport.v1' || report.report_scope !== 'source_only'
-      || report.publication_status !== 'not_published' || report.release_eligible !== false
-      || report.source_inventory_complete !== true || !Array.isArray(report.files)
-      || report.source_check_policy !== policy.source_check_policy
-      || typeof report.formal_checks_eligible !== 'boolean' || typeof report.complete !== 'boolean') return false;
-  try {
-    const files = report.files as Record<string, unknown>[];
-    const actual = files.map(file => ({ path: file.path, byte_length: file.byte_length, sha256: file.sha256 }));
-    if (canonical(actual) !== canonical(expected)) return false;
-    if (report.formal_checks_eligible !== report.complete) return false;
-    if (report.complete) {
-      if (!Array.isArray(report.diagnostics) || report.diagnostics.length) return false;
-      for (const file of files) {
-        if (!Array.isArray(file.declarations)) return false;
-        if (typeof file.path !== 'string') return false;
-        if (!file.path.endsWith('.slate')) {
-          if (file.kind !== 'attachment') return false;
-          if (file.status !== 'not_applicable' || file.declarations.length) return false;
-        } else {
-          if (file.status !== 'passed' || typeof file.module_id !== 'string' || !file.module_id) return false;
-          const hash = file.kind === 'module' ? file.module_object_hash : file.kind === 'theory' ? file.theory_package_hash : null;
-          if (typeof hash !== 'string' || !hash) return false;
-        }
-        for (const declaration of file.declarations as Record<string, unknown>[]) {
-          if (declaration.kind === 'program') return false;
-          if (declaration.kind === 'theorem') {
-            const checked = declaration.checked as Record<string, unknown> | null;
-            if (declaration.status !== 'passed' || !checked || checked.publication_profile !== 'DirectExactProof'
-                || checked.source_proof_kind !== 'inline') return false;
-            for (const key of ['fact_id', 'theory_id', 'canonical_target', 'theory_hash', 'source_hash',
-              'target_hash', 'certificate_hash', 'dependency_closure_hash', 'assumption_closure_hash']) {
-              if (typeof checked[key] !== 'string' || !checked[key]) return false;
-            }
-          } else if (declaration.status !== 'checked_declaration' && declaration.status !== 'checked_theory') return false;
-        }
-      }
-    }
-    return true;
-  } catch { return false; }
-}
+export interface IsolatedRun { code: number | null; outcome: 'exited' | 'timeout' | 'error'; stdout: Buffer; stderr: string }
 
-function sandboxArguments(rootfs: string, input: string): string[] {
+function sandboxArguments(rootfs: string, work: string, argv: string[]): string[] {
   return ['--unshare-all', '--die-with-parent', '--new-session', '--clearenv',
     '--ro-bind', rootfs, '/', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
-    '--ro-bind', input, '/input', '--chdir', '/input', '--setenv', 'TMPDIR', '/tmp',
-    '--setenv', 'LANG', 'C.UTF-8', '--cap-drop', 'ALL', '/slatec', 'check-package', '/input'];
+    '--bind', work, '/work', '--chdir', '/work',
+    '--setenv', 'TMPDIR', '/tmp', '--setenv', 'HOME', '/work/home', '--setenv', 'SLATE_HOME', '/work/home',
+    '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'LANG', 'C.UTF-8', '--cap-drop', 'ALL', ...argv];
 }
 
-export async function runIsolated(rootfs: string, input: string, policy: Policy): Promise<{
-  code: number | null; outcome: 'exited' | 'timeout' | 'error'; stdout: Buffer; stderr: string;
-}> {
+/** Run one program from the fixed rootfs with `work` as its only writable directory. */
+export async function runIsolated(rootfs: string, work: string, policy: Policy, argv: string[]): Promise<IsolatedRun> {
   // Process-count limits belong to the dedicated worker's cgroup (TasksMax),
   // not RLIMIT_NPROC, which would count unrelated processes of the host UID.
-  const args = ['--as=' + policy.memory_bytes, '--nofile=128',
-    '--cpu=' + Math.ceil(policy.timeout_ms / 1000 + 1), '--', '/usr/bin/bwrap', ...sandboxArguments(rootfs, input)];
+  const args = ['--as=' + policy.memory_bytes, '--nofile=256',
+    '--cpu=' + Math.ceil(policy.timeout_ms / 1000 + 1), '--', '/usr/bin/bwrap', ...sandboxArguments(rootfs, work, argv)];
   return new Promise(resolveRun => {
     let outcome: 'exited' | 'timeout' | 'error' = 'exited';
     let size = 0;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let stderrSize = 0;
-    const process = spawn('/usr/bin/prlimit', args, {
-      env: { PATH: '/usr/bin:/bin' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const kill = () => {
-      if (process.pid) try { globalThis.process.kill(-process.pid, 'SIGKILL'); } catch { /* already exited */ }
-    };
+    const child = spawn('/usr/bin/prlimit', args, { env: { PATH: '/usr/bin:/bin' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const kill = () => { if (child.pid) try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already exited */ } };
     const timer = setTimeout(() => { outcome = 'timeout'; kill(); }, policy.timeout_ms);
-    process.stdout.on('data', (chunk: Buffer) => {
+    child.stdout.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > policy.max_output_bytes) { outcome = 'error'; kill(); }
-      else stdout.push(chunk);
+      if (size > policy.max_output_bytes) { outcome = 'error'; kill(); } else stdout.push(chunk);
     });
-    process.stderr.on('data', (chunk: Buffer) => {
+    child.stderr.on('data', (chunk: Buffer) => {
       stderrSize += chunk.length;
-      if (stderrSize <= 64 * 1024) stderr.push(chunk);
-      else { outcome = 'error'; kill(); }
+      if (stderrSize <= 64 * 1024) stderr.push(chunk); else { outcome = 'error'; kill(); }
     });
-    process.on('error', error => { outcome = 'error'; stderr.push(Buffer.from(error.message)); });
-    process.on('close', code => {
+    child.on('error', error => { outcome = 'error'; stderr.push(Buffer.from(error.message)); });
+    child.on('close', code => {
       clearTimeout(timer);
       resolveRun({ code, outcome, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr).toString('utf8') });
     });
   });
 }
 
+async function writeTree(root: string, entries: Iterable<[string, Uint8Array]>, mode = 0o600) {
+  for (const [path, bytes] of entries) {
+    const target = join(root, path);
+    if (!resolve(target).startsWith(resolve(root) + '/')) throw new Error('PathEscapesRoot');
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    await writeFile(target, bytes, { flag: 'wx', mode });
+  }
+}
+
+/** Every module and theory identity in a report package must lie under a declared prefix. */
+export function modulesOutsidePrefixes(report: Record<string, unknown>, name: string, prefixes: string[]): string[] {
+  const outside: string[] = [];
+  for (const pkg of (report.packages as Array<Record<string, unknown>> | undefined) ?? []) {
+    if (pkg.name !== name) continue;
+    for (const file of (pkg.files as Array<Record<string, unknown>> | undefined) ?? []) {
+      if (file.kind !== 'module' && file.kind !== 'theory') continue;
+      const id = typeof file.module_id === 'string' ? file.module_id : '';
+      if (!id || !prefixes.some(prefix => encloses(prefix, id))) outside.push(id || String(file.path));
+    }
+  }
+  return outside;
+}
+
 export class VerificationWorker {
   private toolchain: Toolchain | undefined;
   constructor(readonly directory: string, readonly policy: Policy) {}
+
+  /** Load the pinned rootfs and prove the sandbox runs its client: `slate` with no arguments must fail with usage. */
   async initialize(): Promise<Toolchain> {
-    // This rootfs is operator-owned and must remain read-only to the service.
     this.toolchain = await loadToolchain(this.directory);
     const scratch = await mkdtemp(join(tmpdir(), 'pebble-isolation-probe-'));
     try {
-      const result = await runIsolated(join(resolve(this.directory), 'rootfs'), scratch, this.policy);
-      if (!result.stdout.length) throw new Error('WorkerIsolationProbeFailed: ' + result.stderr.slice(0, 2048));
-      const report = JSON.parse(result.stdout.toString('utf8')) as Record<string, unknown>;
-      if (result.outcome !== 'exited' || result.code !== 1 || report.schema !== 'Slate.PackageCheckReport.v1'
-          || report.formal_checks_eligible !== false || report.source_check_policy !== this.policy.source_check_policy) {
-        throw new Error('WorkerIsolationProbeFailed');
+      const result = await runIsolated(join(resolve(this.directory), 'rootfs'), scratch, this.policy, ['/slate']);
+      if (result.outcome !== 'exited' || result.code !== 1 || !result.stderr.includes('Usage: slate')) {
+        throw new Error('WorkerIsolationProbeFailed: ' + result.stderr.slice(0, 2048));
       }
     } finally { await rm(scratch, { recursive: true, force: true }); }
     return this.toolchain;
   }
-  async verify(lease: JobLease): Promise<JobResult> {
+
+  async verify(lease: JobLease, registry: Registry): Promise<JobResult> {
     if (!this.toolchain) throw new Error('WorkerNotInitialized');
-    const result: JobResult = { outcome: 'error', input_digest: lease.input_digest,
-      toolchain_digest: toolchainDigest(this.toolchain), policy_digest: policyDigest(this.policy) };
-    let scratch: string | undefined;
+    if (lease.toolchain !== registry.options.toolchainTag || toolchainDigest(this.toolchain) !== registry.options.toolchainDigest
+        || policyDigest(this.policy) !== registry.options.policyDigest) return { outcome: 'error', diagnostic: 'ToolchainMismatch' };
+    let work: string | undefined;
     try {
-      if (lease.toolchain_digest !== result.toolchain_digest || lease.policy_digest !== result.policy_digest
-          || lease.input_digest !== verificationInputDigest(lease.root, lease.dependencies, result.toolchain_digest, result.policy_digest)) throw new Error('VerificationInputBindingMismatch');
-      const all = [lease.root, ...lease.dependencies];
-      if (all.length > 1024) throw new Error('DependencyGraphBudgetExceeded');
-      const nodes = new Map(all.map(bundle => [bundle.snapshot.package_id, bundle]));
-      if (nodes.size !== all.length) throw new Error('DependencyIdentityConflict');
-      // Independently check the exact reachable graph before materialization.
-      const visiting = new Set<string>();
-      const visited = new Set<string>();
-      const stack: Array<{ id: string; exit: boolean }> = [{ id: lease.root.snapshot.package_id, exit: false }];
-      while (stack.length) {
-        const next = stack.pop()!;
-        if (next.exit) { visiting.delete(next.id); visited.add(next.id); continue; }
-        if (visiting.has(next.id)) throw new Error('DependencyCycle');
-        if (visited.has(next.id)) continue;
-        const node = nodes.get(next.id)!;
-        visiting.add(next.id);
-        stack.push({ id: next.id, exit: true });
-        for (const edge of node.snapshot.dependencies) {
-          const dependency = nodes.get(edge.package_id);
-          if (!dependency || dependency.snapshot.version !== edge.version
-              || snapshotDigest(dependency.snapshot) !== edge.snapshot_digest) throw new Error('DependencyEdgeMismatch');
-          stack.push({ id: edge.package_id, exit: false });
+      const store = registry.options.objectStore;
+      const keys = registry.stagingKeys(lease);
+      const snapshot = await store.get(keys.snapshot);
+      const bundle = await store.get(keys.interface);
+      if (digestBytes(snapshot) !== lease.cksum || digestBytes(bundle) !== lease.iface_cksum) throw new Error('StagedArchiveCorrupt');
+      const sources = readArchive(snapshot, validatePackagePath);
+      const manifestText = sources.get('Slate.toml');
+      if (!manifestText) throw new Error('SnapshotManifestMissing');
+      const manifest = parseManifest(manifestText.toString('utf8'));
+      if (manifest.name !== lease.name || manifest.version !== lease.version || manifest.toolchain !== lease.toolchain
+          || JSON.stringify(manifest.namespace_prefixes) !== JSON.stringify([...lease.prefixes].sort())) throw new Error('ManifestBindingMismatch');
+      const uploaded = readArchive(bundle, validateInterfacePath);
+      const uploadedInterface = uploaded.get('interface');
+      if (!uploadedInterface) throw new Error('InterfaceEntryMissing');
+
+      // An offline mirror of the registry: index files and archives of the dependency closure.
+      const materials = await registry.mirrorMaterials(manifest.dependencies.map(dependency => dependency.name));
+      work = await mkdtemp(join(tmpdir(), 'pebble-verification-'));
+      await mkdir(join(work, 'home'), { mode: 0o700 });
+      await writeTree(join(work, 'project'), sources);
+      await writeTree(join(work, 'registry'), [
+        ['index/config.json', Buffer.from(JSON.stringify({ dl: 'file:///work/registry/dl/{package}/{version}/{package}-{version}', api: 'file:///work/registry/api/' }))],
+        ...materials.index.map(({ path, text }) => [`index/${path}`, Buffer.from(text)] as [string, Uint8Array]),
+      ]);
+      for (const archive of materials.archives) {
+        const bytes = await store.get(archive.key);
+        await writeTree(join(work, 'registry'), [[`dl/${archive.name}/${archive.version}/${archive.name}-${archive.version}.${archive.suffix}`, bytes]]);
+      }
+      await writeFile(join(work, 'home', 'config.toml'), `[source.registry]\nreplace-with = "mirror"\n[source.mirror]\nindex = "${MIRROR_INDEX}"\n`, { mode: 0o600 });
+      // The client resolves the manifest's own index name through the replacement above.
+      const run = await runIsolated(join(resolve(this.directory), 'rootfs'), work, this.policy,
+        ['/slate', 'check', '--release', '--slatec', '/slatec', '--manifest', '/work/project/Slate.toml']);
+      if (run.outcome !== 'exited') return { outcome: run.outcome, diagnostic: run.outcome === 'timeout' ? 'CheckerTimeout' : 'CheckerProcessError' };
+      let checked: Record<string, unknown>;
+      try { checked = JSON.parse(run.stdout.toString('utf8')) as Record<string, unknown>; }
+      catch { return { outcome: 'incomplete', diagnostic: ('CheckFailed: ' + run.stderr.trim()).slice(0, 4096) }; }
+      if (run.code !== 0 || checked.status !== 'checked' || checked.mode !== 'release' || checked.dev_mode !== false) {
+        return { outcome: 'incomplete', diagnostic: ('CheckIncomplete: ' + run.stderr.trim()).slice(0, 4096) };
+      }
+      const report = JSON.parse(await readFile(join(work, 'project', '.slate', 'report.json'), 'utf8')) as Record<string, unknown>;
+      if (report.complete !== true || report.release_eligible !== false || report.dev_mode !== false) throw new Error('ReportNotComplete');
+      const interfaceText = await readFile(join(work, 'project', '.slate', 'interfaces', `${lease.name}.interface`), 'utf8');
+      if (!Buffer.from(interfaceText).equals(uploadedInterface)) {
+        const ours = interfaceText.split('\n'), theirs = uploadedInterface.toString('utf8').split('\n');
+        const at = ours.findIndex((line, i) => line !== theirs[i]);
+        throw new Error(`InterfaceMismatch: the uploaded interface differs from the checked one at line ${at + 1}: checked ${JSON.stringify((ours[at] ?? '').slice(0, 200))}, uploaded ${JSON.stringify((theirs[at] ?? '').slice(0, 200))}`);
+      }
+      // Every shipped statement must be exactly what this check persisted; nothing else may be shipped.
+      const objects = join(work, 'project', '.slate', 'cache', 'objects');
+      const expected = new Map<string, Buffer>([['interface', uploadedInterface]]);
+      for (const pkg of (report.packages as Array<Record<string, unknown>>)) {
+        if (pkg.name !== lease.name) continue;
+        for (const file of pkg.files as Array<Record<string, unknown>>) {
+          if (typeof file.module_id !== 'string' || typeof file.module_object_hash !== 'string') continue;
+          for (const suffix of ['slateobj', 'slatecache']) {
+            const path = `objects/${file.module_id}/${file.module_object_hash}.${suffix}`;
+            expected.set(path, await readFile(join(objects, file.module_id, `${file.module_object_hash}.${suffix}`)));
+          }
         }
       }
-      if (visited.size !== nodes.size) throw new Error('UnreachableDependency');
-      const ids = new Set<string>();
-      const expected: FileEntry[] = [];
-      let total = 0;
-      scratch = await mkdtemp(join(tmpdir(), 'pebble-verification-'));
-      for (const raw of all) {
-        const bundle = validateBundle(raw);
-        if (ids.has(bundle.snapshot.package_id) || bundle.snapshot.toolchain_digest !== result.toolchain_digest) throw new Error('DependencyIdentityConflict');
-        ids.add(bundle.snapshot.package_id);
-        const blobs = new Map(bundle.blobs.map(blob => [blob.sha256, Buffer.from(blob.content_base64, 'base64')]));
-        for (const file of bundle.snapshot.files) {
-          total += file.byte_length;
-          if (total > 256 * 1024 * 1024 || expected.length >= 16384) throw new Error('DependencyGraphBudgetExceeded');
-          const path = `packages/${bundle.snapshot.package_id}/${file.path}`;
-          const target = join(scratch, path);
-          await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-          await writeFile(target, blobs.get(file.sha256)!, { flag: 'wx', mode: 0o400 });
-          expected.push({ ...file, path });
-        }
+      if (uploaded.size !== expected.size || [...expected].some(([path, bytes]) => !uploaded.get(path)?.equals(bytes))) {
+        throw new Error('StatementBundleMismatch: the uploaded statements differ from the checked ones');
       }
-      expected.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
-      const run = await runIsolated(join(resolve(this.directory), 'rootfs'), scratch, this.policy);
-      if (run.outcome !== 'exited') return { ...result, outcome: run.outcome, diagnostic: run.outcome === 'timeout' ? 'CheckerTimeout' : 'CheckerProcessError' };
-      if (run.code !== 0 && run.code !== 1) return { ...result, diagnostic: 'CheckerProcessFailed: ' + run.stderr.slice(0, 2048) };
-      const report = JSON.parse(run.stdout.toString('utf8')) as Record<string, unknown>;
-      if (!reportMatchesInput(report, expected, this.policy)) throw new Error('IncompleteOrMismatchedCheckerReport');
-      if ((run.code === 0) !== (report.formal_checks_eligible === true)) throw new Error('CheckerExitReportMismatch');
-      for (const file of expected) {
-        const bytes = await readFile(join(scratch, file.path));
-        if (bytes.length !== file.byte_length || digestBytes(bytes) !== file.sha256) throw new Error('VerificationSourcesChanged');
+      const outside = modulesOutsidePrefixes(report, lease.name, manifest.namespace_prefixes);
+      if (outside.length) throw new Error(`ModuleOutsideDeclaredPrefixes: ${outside.sort().join(', ')}`);
+      const next = parseInterface(interfaceText);
+      const previous = await registry.previousInterface(lease.name, lease.version);
+      let computed: Level = 'patch';
+      let reasons: string[] = ['first published version'];
+      if (previous) ({ level: computed, reasons } = compareInterfaces(parseInterface(previous.interface_text), next));
+      if (!levelAtLeast(lease.level, computed)) {
+        return { outcome: 'rejected', report, computed_level: computed, interface_text: interfaceText,
+          diagnostic: `DeclaredLevelBelowComputed: declared ${lease.level} but the interface change is ${computed} (${reasons.join('; ')})` };
       }
-      return { ...result, outcome: report.formal_checks_eligible ? 'passed' : 'incomplete', report,
-        diagnostic: report.formal_checks_eligible ? undefined : 'FormalSourceChecksIncomplete' };
+      // The sources must be untouched by the run.
+      for (const [path, bytes] of sources) {
+        if (!(await readFile(join(work, 'project', path))).equals(Buffer.from(bytes))) throw new Error('VerificationSourcesChanged');
+      }
+      return { outcome: 'passed', report, computed_level: computed, interface_text: interfaceText };
     } catch (error) {
-      return { ...result, diagnostic: error instanceof Error ? error.message : 'VerificationFailed' };
-    } finally { if (scratch) await rm(scratch, { recursive: true, force: true }); }
+      return { outcome: 'error', diagnostic: error instanceof Error ? error.message : 'VerificationFailed' };
+    } finally { if (work) await rm(work, { recursive: true, force: true }); }
   }
+
+  /** Claim, verify, record; a maintainer's passing candidate publishes immediately. */
   async runOne(registry: Registry): Promise<boolean> {
     const lease = await registry.claimJob();
     if (!lease) return false;
     const heartbeat = setInterval(() => { void registry.renewJob(lease).catch(() => false); }, 5000);
-    try { await registry.completeJob(lease, await this.verify(lease)); }
+    let result: JobResult;
+    try { result = await this.verify(lease, registry); await registry.completeJob(lease, result); }
     finally { clearInterval(heartbeat); }
+    if (result.outcome === 'passed' && lease.creator_maintainer) await registry.publishCandidate(lease.candidate_id);
     return true;
   }
 }
+

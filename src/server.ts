@@ -1,11 +1,14 @@
 import Fastify, { type FastifyRequest } from 'fastify';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
-import { Registry } from './registry.js';
+import { publicKey, type Registry } from './registry.js';
+
+const INDEX_PATH = /^\/index\/(config\.json|(?:[a-z0-9]{1,2}|3\/[a-z])\/[a-z][a-z0-9_-]{0,63}|[a-z0-9]{2}\/[a-z0-9]{2}\/[a-z][a-z0-9_-]{0,63})$/;
+const STATIC_PATH = /^\/static\/(packages\/[a-z][a-z0-9_-]{0,63}\/[0-9A-Za-z.-]{1,64}\/[a-z][a-z0-9_-]{0,63}-[0-9A-Za-z.-]{1,64}\.(?:slatepkg|interface)|toolchains\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[a-z0-9_]+-[a-z0-9_]+\/(?:slatec|slate|slatec\.sha256|TOOLCHAIN\.lock))$/;
 
 export function createServer(registry: Registry) {
   const trustedProxies = process.env.TRUST_PROXY_CIDRS?.split(',').map(value => value.trim()).filter(Boolean);
-  const app = Fastify({ logger: {redact:['req.headers.authorization','req.headers.cookie']}, bodyLimit: 48 * 1024 * 1024, requestTimeout: 30_000, connectionTimeout: 10_000, trustProxy: trustedProxies?.length ? trustedProxies : false });
+  const app = Fastify({ logger: {redact:['req.headers.authorization','req.headers.cookie']}, bodyLimit: 96 * 1024 * 1024, requestTimeout: 120_000, connectionTimeout: 10_000, trustProxy: trustedProxies?.length ? trustedProxies : false });
   app.register(helmet);
   app.register(rateLimit, {max:180,timeWindow:'1 minute'});
   let inFlight = 0;
@@ -32,9 +35,10 @@ export function createServer(registry: Registry) {
       return reply.code(404).send({error:'not_found',message:'Route not found'});
     }
     if (path.startsWith('/health/')) return;
-    const heavy = (request.method === 'POST' && /\/snapshots$/.test(path))
-      || (request.method === 'GET' && (/\/snapshots\/[a-f0-9]{64}$/.test(path) || /^\/api\/v1\/candidates\/[^/]+$/.test(path)));
-    if (inFlight >= 64 || (heavy && heavyInFlight >= 2)) {
+    // Archive uploads and archive reads hold object-store connections.
+    const heavy = (request.method === 'PUT' && path === '/api/v1/packages/new')
+      || (request.method === 'GET' && path.startsWith('/static/'));
+    if (inFlight >= 64 || (heavy && heavyInFlight >= 4)) {
       return reply.code(503).header('Retry-After','1').send({error:'server_busy',message:'Request concurrency limit reached; retry shortly'});
     }
     admitted.set(request,{heavy,handlerStarted:false,settled:false,transportEnded:false});
@@ -51,6 +55,22 @@ export function createServer(registry: Registry) {
     // admission slot until onResponse, unless its connection is already gone.
     if (request.raw.aborted || reply.raw.destroyed) transportEnded(request);
   });
+  const begin = (request:FastifyRequest) => {
+    const admission = admitted.get(request);
+    // A body may finish parsing just as its transport closes. Once its unused
+    // slot has been returned, that abandoned request must never start work.
+    if (!admission || admission.transportEnded) return null;
+    admission.handlerStarted = true;
+    return admission;
+  };
+  const settle = (request:FastifyRequest) => {
+    const admission = admitted.get(request);
+    if (!admission) return;
+    admission.settled = true;
+    // A disconnected client does not cancel S3 or database work. Keep the
+    // capacity reserved until that work actually settles, even on errors.
+    if (admission.transportEnded) release(request);
+  };
   // Route hooks installed by helmet/rate-limit must exist before routes are
   // declared. Registering routes synchronously above the plugin boot sequence
   // leaves configuration present but the actual rate-limit hooks absent.
@@ -64,27 +84,44 @@ export function createServer(registry: Registry) {
     bodyLimit:1024,
     config:{rateLimit:{max:5,timeWindow:'1 minute',keyGenerator:(request:FastifyRequest) => request.ip}},
   }, async (request,reply) => {
-    const admission = admitted.get(request);
-    if (!admission || admission.transportEnded) { reply.raw.destroy(); return; }
-    admission.handlerStarted = true;
+    if (!begin(request)) { reply.raw.destroy(); return; }
     try {
       reply.header('Cache-Control','no-store');
       const result = await registry.request('POST','/api/v1/invitations/redeem',request.body);
       return reply.code(result.status).send(result.body);
-    } finally {
-      admission.settled = true;
-      if (admission.transportEnded) release(request);
-    }
+    } finally { settle(request); }
+  });
+  // The public read tree (`public/index/...`, `public/packages/...`,
+  // `public/toolchains/...`) for local runs and mirrors without static hosts.
+  const readTree = async (request:FastifyRequest, reply:import('fastify').FastifyReply, key:string, contentType:string) => {
+    if (!begin(request)) { reply.raw.destroy(); return; }
+    try {
+      let bytes: Buffer;
+      try { bytes = await registry.options.objectStore.get(publicKey(key)); }
+      catch (error) {
+        if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return reply.code(404).send({error:'not_found',message:'No such file'});
+        throw error;
+      }
+      return reply.header('Cache-Control', key.startsWith('index/') ? 'no-cache' : 'public, max-age=31536000, immutable').type(contentType).send(bytes);
+    } finally { settle(request); }
+  };
+  app.get('/index/*', {config:{rateLimit:{max:600,timeWindow:'1 minute'}}}, async (request, reply) => {
+    const path = new URL(request.url,'http://registry.invalid').pathname;
+    const match = INDEX_PATH.exec(path);
+    if (!match) return reply.code(404).send({error:'not_found',message:'No such index file'});
+    return readTree(request, reply, 'index/' + match[1]!, match[1] === 'config.json' ? 'application/json' : 'text/plain; charset=utf-8');
+  });
+  app.get('/static/*', {config:{rateLimit:{max:600,timeWindow:'1 minute'}}}, async (request, reply) => {
+    const path = new URL(request.url,'http://registry.invalid').pathname;
+    const match = STATIC_PATH.exec(path);
+    if (!match) return reply.code(404).send({error:'not_found',message:'No such file'});
+    return readTree(request, reply, match[1]!, 'application/octet-stream');
   });
   app.route({ method: ['GET','POST','PUT','DELETE'], url: '/api/v1/*', config:{rateLimit:{
     max:(request) => request.method === 'GET' ? 180 : 30,timeWindow:'1 minute',
     keyGenerator:(request) => `${request.ip}:${request.method === 'GET' ? 'read' : 'write'}`,
   }}, handler: async (request, reply) => {
-    const admission = admitted.get(request);
-    // A body may finish parsing just as its transport closes. Once its unused
-    // slot has been returned, that abandoned request must never start work.
-    if (!admission || admission.transportEnded) { reply.raw.destroy(); return; }
-    admission.handlerStarted = true;
+    if (!begin(request)) { reply.raw.destroy(); return; }
     try {
       reply.header('Cache-Control','no-store');
       const auth = request.headers.authorization;
@@ -92,17 +129,9 @@ export function createServer(registry: Registry) {
       const token = auth?.slice(7);
       const response = await registry.request(request.method, request.url, request.body ?? {}, token, {
         'idempotency-key': typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'] : undefined,
-        'if-match': typeof request.headers['if-match'] === 'string' ? request.headers['if-match'] : undefined,
       });
       return reply.code(response.status).send(response.body);
-    } finally {
-      if (admission) {
-        admission.settled = true;
-        // A disconnected client does not cancel S3 or database work. Keep the
-        // capacity reserved until that work actually settles, even on errors.
-        if (admission.transportEnded) release(request);
-      }
-    }
+    } finally { settle(request); }
   } });
   });
   app.setErrorHandler((error,request,reply) => {
