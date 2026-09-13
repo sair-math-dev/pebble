@@ -1,0 +1,55 @@
+# Cloudflare Tunnel variant of the three-host edge: cloudflared terminates TLS
+# at Cloudflare and connects to this Caddy over loopback HTTP, so the three
+# sites are plain http:// hosts. The real client address arrives in
+# CF-Connecting-IP; it is forwarded to the API as X-Forwarded-For.
+{
+	auto_https off
+}
+
+(upstream) {
+	reverse_proxy api:3000 {
+		header_up X-Forwarded-For {header.CF-Connecting-IP}
+		health_uri /health/ready
+		health_interval 10s
+		health_timeout 3s
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 120s
+		}
+	}
+}
+
+http://{$PEBBLE_INDEX_DOMAIN} {
+	@read method GET HEAD
+	handle @read {
+		rewrite * /index{uri}
+		import upstream
+	}
+	handle {
+		respond 405
+	}
+}
+
+http://{$PEBBLE_STATIC_DOMAIN} {
+	@read method GET HEAD
+	handle @read {
+		rewrite * /static{uri}
+		import upstream
+	}
+	handle {
+		respond 405
+	}
+}
+
+http://{$PEBBLE_API_DOMAIN} {
+	request_body {
+		max_size 100663296
+	}
+	@api path /api/v1/* /health/*
+	handle @api {
+		import upstream
+	}
+	handle {
+		respond 404
+	}
+}

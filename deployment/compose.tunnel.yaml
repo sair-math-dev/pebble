@@ -1,0 +1,132 @@
+# Single-host deployment behind a Cloudflare Tunnel: PostgreSQL, MinIO, the API
+# and an HTTP-only Caddy edge on loopback. Every stateful byte lives under
+# ${PEBBLE_STATE_DIR} as plain directories (no named volumes), so moving the
+# registry to another host is: stop, copy that directory plus the env file and
+# the cloudflared credentials, start (see host-export.sh / host-import.sh). cloudflared runs on the host and
+# forwards index./static./slate.<domain> to the edge port. The worker runs on
+# the host under systemd (bubblewrap needs the host kernel), not here.
+name: pebble
+
+x-app: &app
+  image: ${PEBBLE_IMAGE:-pebble:tunnel}
+  build:
+    context: ..
+    target: api
+    args:
+      NODE_IMAGE: ${NODE_IMAGE:?Run node deployment/pin-images.mjs first}
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+  environment: &environment
+    NODE_ENV: production
+    HOST: 0.0.0.0
+    PORT: "3000"
+    REGISTRY_ID: ${REGISTRY_ID:?Set in tunnel.env}
+    PEBBLE_TOOLCHAIN_TAG: ${PEBBLE_TOOLCHAIN_TAG:?Set in tunnel.env}
+    PEBBLE_INDEX_ROOT: https://${PEBBLE_INDEX_DOMAIN:?Set in tunnel.env}/
+    PEBBLE_DL_TEMPLATE: https://${PEBBLE_STATIC_DOMAIN:?Set in tunnel.env}/packages/{package}/{version}/{package}-{version}
+    PEBBLE_API_ROOT: https://${PEBBLE_API_DOMAIN:?Set in tunnel.env}/api/v1
+    TRUST_PROXY_CIDRS: ${PEBBLE_EDGE_IP:-172.31.0.2}/32
+    SLATE_ROOTFS: /opt/slate
+    DATABASE_URL: postgres://pebble:${POSTGRES_PASSWORD:?Set in tunnel.env}@postgres:5432/pebble
+    DB_POOL_SIZE: "10"
+    S3_ENDPOINT: http://minio:9000
+    S3_REGION: us-east-1
+    S3_BUCKET: pebble
+    S3_FORCE_PATH_STYLE: "true"
+    AWS_ACCESS_KEY_ID: pebble-local
+    AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:?Set in tunnel.env}
+  volumes:
+    - ${SLATE_TOOLCHAIN_DIR:?Set in tunnel.env}/toolchain.json:/opt/slate/toolchain.json:ro
+    - ${SLATE_TOOLCHAIN_DIR:?Set in tunnel.env}/digest.txt:/opt/slate/digest.txt:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_started
+  networks: [ingress]
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?Run node deployment/pin-images.mjs first}
+    environment:
+      POSTGRES_USER: pebble
+      POSTGRES_DB: pebble
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set in tunnel.env}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["${PEBBLE_STATE_DIR:?Set in tunnel.env}/postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pebble -d pebble"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks: [ingress]
+
+  minio:
+    image: ${MINIO_IMAGE:?Run node deployment/pin-images.mjs first}
+    command: [server, /data, --console-address, ":9001"]
+    environment:
+      MINIO_ROOT_USER: pebble-local
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:?Set in tunnel.env}
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    volumes: ["${PEBBLE_STATE_DIR:?Set in tunnel.env}/minio:/data"]
+    restart: unless-stopped
+    networks: [ingress]
+
+  migrate:
+    <<: *app
+    command: [migrate]
+    restart: "no"
+
+  storage-init:
+    <<: *app
+    entrypoint: ["node", "deployment/init-storage.mjs"]
+    command: []
+    restart: "no"
+    volumes:
+      - ./init-storage.mjs:/app/deployment/init-storage.mjs:ro
+
+  api:
+    <<: *app
+    command: [serve]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "deployment/healthcheck.mjs"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    networks:
+      ingress:
+        ipv4_address: ${PEBBLE_API_IP:-172.31.0.3}
+
+  edge:
+    image: ${CADDY_IMAGE:?Run node deployment/pin-images.mjs first}
+    environment:
+      PEBBLE_INDEX_DOMAIN: ${PEBBLE_INDEX_DOMAIN:?Set in tunnel.env}
+      PEBBLE_STATIC_DOMAIN: ${PEBBLE_STATIC_DOMAIN:?Set in tunnel.env}
+      PEBBLE_API_DOMAIN: ${PEBBLE_API_DOMAIN:?Set in tunnel.env}
+    ports: ["127.0.0.1:${PEBBLE_EDGE_PORT:-8081}:80"]
+    volumes: ["./Caddyfile.tunnel:/etc/caddy/Caddyfile:ro"]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777", "/config", "/data"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      ingress:
+        ipv4_address: ${PEBBLE_EDGE_IP:-172.31.0.2}
+
+networks:
+  ingress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${PEBBLE_PRIVATE_SUBNET:-172.31.0.0/24}
+

@@ -197,3 +197,32 @@ S3 bucket 开启版本保留，应用身份不给 `DeleteObjectVersion`。独立
 `/health/live` 用于进程存活，`/health/ready` 用于摘流判断；另外监测对象存储与一次完整业务探针。依赖不可用时不要用频繁重启制造雪崩。日志保留请求/任务/attempt ID 和操作结果，避免 token、数据库 URL、完整私有源码或未授权报告内容。告警应有处理人和恢复步骤，阈值由真实基线调整。
 
 每次发布记录确切代码/镜像/rootfs/政策/迁移版本、执行者、时间、验证结果和回滚落点。本次已完成本地真实联调、隔离测试及小数据备份恢复；生产容器运行、TLS、托管 PITR/版本恢复、故障切换和公网 SLO 仍需在选定部署目标验收。
+
+## 8. 单机 Cloudflare Tunnel 部署与迁移
+
+2026-09-12 首个实际部署形态：一台临时 Linux 主机，无入向端口，三个主机名由 Cloudflare Tunnel 接到本机。设计目标是**迁移友好**：所有状态都是普通目录，换机器等于停服务、拷目录、起服务，域名与注册表身份不变。
+
+| 部件 | 位置 | 说明 |
+| --- | --- | --- |
+| PostgreSQL、MinIO、API、Caddy edge | `deployment/compose.tunnel.yaml` | edge 只监听 `127.0.0.1:${PEBBLE_EDGE_PORT}`（HTTP），按 Host 把 `index.`/`static.`/`slate.` 三个域名重写到 API 的 `/index`、`/static`、`/api/v1` 前缀；真实客户端地址取 `CF-Connecting-IP` |
+| 全部状态 | `${PEBBLE_STATE_DIR}/postgres`、`${PEBBLE_STATE_DIR}/minio` | bind mount 的普通目录，没有 named volume；MinIO 数据里就是公开索引与归档树 |
+| 配置与秘密 | `deployment/tunnel.env`（0600，被 Git 忽略） | 数据库/MinIO 口令、`REGISTRY_ID`、`PEBBLE_TOOLCHAIN_TAG`、三个域名、状态目录 |
+| 隧道 | `/etc/cloudflared/config.yml` + `<tunnel-id>.json` | 由 `deployment/tunnel-setup.sh` 从 `cloudflared.yml` 模板生成并安装为 systemd 服务 |
+| worker | `/opt/pebble/current`、`/opt/pebble/toolchains/current`、`/etc/pebble/worker.env`、`pebble-worker.service` | `deployment/worker-install.sh` 幂等安装；单元允许 `AF_NETLINK` 且不启用 `ProtectKernelTunables/Logs/ControlGroups`，否则 bubblewrap 无法在沙箱里挂 `/proc` |
+
+镜像：MinIO 已从 Docker Hub 下架，`images.env` 改为 `quay.io/minio/minio@<同一 digest>`。
+
+首次部署顺序（`deployment/` 目录内，`C` 为 `docker compose --env-file images.env --env-file tunnel.env -f compose.tunnel.yaml`）：
+
+```sh
+node dist/main.js toolchain --slatec SLATEC --slate SLATE --output local/toolchain-<tag>   # 与 tunnel.env 的 SLATE_TOOLCHAIN_DIR 一致
+$C build api && $C up -d postgres minio && $C run --rm storage-init && $C run --rm migrate && $C up -d api edge
+$C run --rm migrate provision --name OWNER --grant                   # 一次性打印 token；存到私有位置
+$C run --rm -v SLATEC:/mnt/slatec:ro -v TOOLCHAIN.lock:/mnt/TOOLCHAIN.lock:ro migrate toolchain-publish --tag <tag> --host x86_64-linux --slatec /mnt/slatec --lock /mnt/TOOLCHAIN.lock
+./worker-install.sh
+cloudflared tunnel login && ./tunnel-setup.sh                        # 需要拥有域名的 Cloudflare 账号在浏览器里授权一次
+```
+
+一次性运维命令用 `migrate` 服务承载（它没有固定 IP，`api` 服务有）。冒烟：`curl https://slate.verifiable.ai/health/ready`、`curl https://index.verifiable.ai/config.json`，再用 `slate publish` 发一个真实包并观察 worker 日志。
+
+迁移：旧机器 `deployment/host-export.sh /path/pebble.tar.zst`（停服务、打包状态目录 + `tunnel.env` + 工具链 + `/etc/cloudflared` + `/etc/pebble/worker.env`，再拉起），新机器同一 commit 的仓库里 `deployment/host-import.sh /path/pebble.tar.zst` 然后 `worker-install.sh`。隧道凭据随包迁走，DNS 不用改；旧机器停掉 cloudflared 即完成切换。日常备份仍用 `backup.mjs`（逻辑 dump，可在不停机时做）。

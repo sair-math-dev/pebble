@@ -12,7 +12,8 @@ const client = new S3Client({ endpoint: endpoint.href, region, forcePathStyle: t
 try {
   await client.send(new HeadBucketCommand({ Bucket }));
 } catch (error) {
-  if (error.$metadata?.httpStatusCode !== 404) throw error;
+  // MinIO reports a missing bucket as NotFound/NoSuchBucket, not always with a 404 status.
+  if (error.$metadata?.httpStatusCode !== 404 && !['NotFound', 'NoSuchBucket'].includes(error.name)) throw error;
   try {
     await client.send(new CreateBucketCommand({ Bucket,
       ...(region === 'us-east-1' ? {} : { CreateBucketConfiguration: { LocationConstraint: region } }),

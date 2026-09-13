@@ -1,0 +1,13 @@
+# cloudflared configuration for the Pebble tunnel (install as /etc/cloudflared/config.yml).
+# TLS is terminated by Cloudflare; every hostname is forwarded to the loopback
+# Caddy edge, which routes by Host header to the index, static and API trees.
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_ID.json
+ingress:
+  - hostname: index.verifiable.ai
+    service: http://127.0.0.1:8081
+  - hostname: static.verifiable.ai
+    service: http://127.0.0.1:8081
+  - hostname: slate.verifiable.ai
+    service: http://127.0.0.1:8081
+  - service: http_status:404
