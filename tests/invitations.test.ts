@@ -14,7 +14,7 @@ import { type ObjectStore } from '../src/object-store.js';
 import { DEFAULT_POLICY, digestBytes, policyDigest, toolchainDigest, type Toolchain } from '../src/protocol.js';
 
 const environmentFile = process.env.PEBBLE_TEST_ENV ?? '.artifacts/test-env.json';
-const toolchainDirectory = process.env.PEBBLE_TEST_TOOLCHAIN ?? '.artifacts/toolchain-pinned';
+const toolchainDirectory = process.env.PEBBLE_TEST_TOOLCHAIN ?? '.artifacts/toolchain-adr0188';
 const available = existsSync(environmentFile) && existsSync(`${toolchainDirectory}/toolchain.json`);
 const newToken = () => randomBytes(32).toString('hex');
 const unknownCode = () => randomBytes(32).toString('base64url');
@@ -29,9 +29,10 @@ test('invitation registration uses real PostgreSQL transactions and HTTP authent
   databaseUrl.searchParams.set('options',`-c search_path=${schema}`);
   const toolchain = JSON.parse(await readFile(resolve(toolchainDirectory,'toolchain.json'),'utf8')) as Toolchain;
   const denyStorage = async ():Promise<never> => {throw new Error('Invitation registration must not access source storage or mathematical verification');};
-  const objectStore:ObjectStore = {put:denyStorage,get:denyStorage,has:denyStorage,healthy:denyStorage};
+  // Bootstrapping writes the public `config.json`; nothing else may reach storage.
+  const objectStore:ObjectStore = {put:async (key:string) => {if (key !== 'public/index/config.json') await denyStorage();},get:denyStorage,has:denyStorage,copy:denyStorage,healthy:denyStorage};
   const registry = new Registry({databaseUrl:databaseUrl.toString(),registryId:randomUUID(),toolchain,
-    policy:DEFAULT_POLICY,toolchainDigest:toolchainDigest(toolchain),policyDigest:policyDigest(DEFAULT_POLICY),objectStore});
+    policy:DEFAULT_POLICY,toolchainDigest:toolchainDigest(toolchain),policyDigest:policyDigest(DEFAULT_POLICY),objectStore,toolchainTag:'local'});
   const previousProxy = process.env.TRUST_PROXY_CIDRS;
   process.env.TRUST_PROXY_CIDRS = '127.0.0.1';
   const app = createServer(registry);
@@ -65,12 +66,12 @@ test('invitation registration uses real PostgreSQL transactions and HTTP authent
       // This isolated schema has no invitation rows; its existing principal is
       // retained across the operator upgrade of a previous registry schema.
       await registry.db.pool.query('DROP TABLE invitations');
-      await registry.db.pool.query('DELETE FROM schema_migrations WHERE version=2');
-      await assert.rejects(registry.initialize(),/requires migration 2/);
+      await registry.db.pool.query('DELETE FROM schema_migrations WHERE version=3');
+      await assert.rejects(registry.initialize(),/requires migration 3/);
       await registry.initialize({migrate:true});
       await registry.initialize({migrate:true});
       await registry.initialize();
-      assert.equal((await registry.db.pool.query('SELECT 1 FROM schema_migrations WHERE version=2')).rowCount,1);
+      assert.equal((await registry.db.pool.query('SELECT 1 FROM schema_migrations WHERE version=3')).rowCount,1);
       assert.equal((await registry.db.pool.query('SELECT count(*)::integer AS count FROM invitations')).rows[0]!.count,0);
       const retained=await principal(existing.name); assert.ok(retained);
       assert.equal(retained.id,existing.id); assert.equal(retained.token_hash,digestBytes(token));
@@ -119,7 +120,7 @@ test('invitation registration uses real PostgreSQL transactions and HTTP authent
         cleanOutput(second);
         assert.deepEqual(JSON.parse(second.stdout),principalOutput);
         assert.ok((await readFile(credentialFile)).equals(bytes),'A successful retry must not rotate or rewrite credentials');
-        const created=await request('POST','/api/v1/packages',{name:'actual-cli-user/private-research'},
+        const created=await request('POST','/api/v1/packages',{name:'actual-cli-private-research',visibility:'private'},
           {authorization:`Bearer ${credentials.token}`,'idempotency-key':randomUUID()});
         assert.equal(created.status,201);assert.equal(created.body.visibility,'private');
 
@@ -186,12 +187,12 @@ test('invitation registration uses real PostgreSQL transactions and HTTP authent
       assert.ok(!serialized.includes(invitation.code),'Only an invitation hash may be persisted');
       assert.ok(!serialized.includes(token),'Login token plaintext must not enter invitation history');
       assert.ok(serialized.includes(digestBytes(invitation.code)),'The stored invitation hash binds the actually issued code');
-      const response=await request('POST','/api/v1/packages',{name:'invited-owner/research'},{authorization:`Bearer ${token}`,'idempotency-key':randomUUID()});
+      const response=await request('POST','/api/v1/packages',{name:'invited-owner-research',visibility:'private'},{authorization:`Bearer ${token}`,'idempotency-key':randomUUID()});
       assert.equal(response.status,201);
       assert.equal(response.body.visibility,'private');
-      const unauthenticated=await request('POST','/api/v1/packages',{name:'without-invitation/research'},{'idempotency-key':randomUUID()});
+      const unauthenticated=await request('POST','/api/v1/packages',{name:'without-invitation-research'},{'idempotency-key':randomUUID()});
       assert.equal(unauthenticated.status,401);
-      const invalidToken=await request('POST','/api/v1/packages',{name:'unregistered-token/research'},{authorization:`Bearer ${newToken()}`,'idempotency-key':randomUUID()});
+      const invalidToken=await request('POST','/api/v1/packages',{name:'unregistered-token-research'},{authorization:`Bearer ${newToken()}`,'idempotency-key':randomUUID()});
       assert.equal(invalidToken.status,401);
       const meta=await request('GET','/api/v1/meta');
       assert.equal(meta.status,200); assert.equal(meta.body.registration,'invitation_only');

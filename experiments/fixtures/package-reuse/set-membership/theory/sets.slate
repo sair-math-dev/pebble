@@ -2,7 +2,7 @@
 // This is not a complete axiomatization of set theory or an assertion of ZF/ZFC.
 // SPDX-License-Identifier: Apache-2.0
 sealed theory Pebble.Fixtures.Sets.Membership
-    logic Logic.ClassicalManySortedFOL.EID.v1
+    logic Logic.ClassicalManySortedFOL.EID
 
     sort Set
     relation member(element : Set, container : Set)

@@ -2,7 +2,7 @@
 // Changed for this fixture: combined the theory hierarchy and renamed its identity.
 // SPDX-License-Identifier: Apache-2.0
 sealed theory Pebble.Fixtures.Algebra.Group
-    logic Logic.ClassicalManySortedFOL.EID.v1
+    logic Logic.ClassicalManySortedFOL.EID
 
     sort Element
     function multiply(left : Element, right : Element) returns Element
