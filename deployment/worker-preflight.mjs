@@ -12,7 +12,7 @@ export async function preflight() {
   // Reuse the exact production worker probe, policy, argv and parser. This
   // deployment launcher has no second definition of a successful check.
   await new VerificationWorker(directory, DEFAULT_POLICY).initialize();
-  console.log('Worker namespace/rootfs probe passed; an empty input was correctly rejected.');
+  console.log('Worker namespace/rootfs probe passed; the frozen slate client answered with its usage error.');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await preflight();

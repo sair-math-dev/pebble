@@ -4,7 +4,7 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
-import { Transform } from 'node:stream';
+import { Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { parseArgs } from 'node:util';
 import pg from 'pg';
@@ -68,27 +68,35 @@ async function fileHash(path) {
   if (size !== status.size) throw new Error('Backup file changed while reading');
   return { byte_length: size, sha256: hash.digest('hex') };
 }
-function measureObject(expected) {
+const MAX_OBJECT_BYTES = 512 * 1024 * 1024;
+function measureObject(expected, byteLength) {
   const hash = createHash('sha256');
   let size = 0;
   const stream = new Transform({ transform(chunk, _encoding, callback) {
     size += chunk.length;
-    if (size > expected.byte_length) return callback(new Error('Object exceeds declared length'));
+    if (size > byteLength) return callback(new Error('Object exceeds declared length'));
     hash.update(chunk); callback(null, chunk);
   } });
   return { stream, finish() {
-    if (size !== expected.byte_length || hash.digest('hex') !== expected.digest) throw new Error('Object digest/length mismatch');
+    if (size !== byteLength || hash.digest('hex') !== expected.digest) throw new Error('Object digest/length mismatch');
+    return size;
   } };
 }
-async function objectToFile(client, bucket, expected, path) {
-  const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: `objects/${expected.digest}` }));
-  if (!result.Body || result.ContentLength !== expected.byte_length) throw new Error('Object length differs from database');
-  const measure = measureObject(expected);
-  await pipeline(result.Body, measure.stream, createWriteStream(path, { flags: 'wx', mode: 0o600 }));
-  measure.finish();
+/** Fetch one referenced archive, verify its content digest and record its length. The
+ *  same digest may be referenced under a staging and a public key; the file is kept once. */
+async function objectToFile(client, bucket, expected, path, alreadyStored) {
+  const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: expected.key }));
+  if (!result.Body || !Number.isSafeInteger(result.ContentLength) || result.ContentLength < 0 || result.ContentLength > MAX_OBJECT_BYTES) throw new Error('Object length unavailable or out of bounds');
+  const measure = measureObject(expected, result.ContentLength);
+  if (alreadyStored) {
+    await pipeline(result.Body, measure.stream, new Writable({ write(_chunk, _encoding, callback) { callback(); } }));
+  } else {
+    await pipeline(result.Body, measure.stream, createWriteStream(path, { flags: 'wx', mode: 0o600 }));
+  }
+  expected.byte_length = measure.finish();
 }
 async function checkRemoteObject(client, bucket, expected) {
-  const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: `objects/${expected.digest}` }));
+  const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: expected.key }));
   if (!result.Body || result.ContentLength !== expected.byte_length) throw new Error('Restored object length mismatch');
   const hash = createHash('sha256');
   let size = 0;
@@ -101,27 +109,35 @@ async function checkRemoteObject(client, bucket, expected) {
 }
 async function inventory(database, schema) {
   const tables = (await database.query('SELECT schemaname,tablename FROM pg_tables WHERE schemaname=$1 ORDER BY schemaname,tablename', [schema])).rows;
-  if (!tables.some(table => table.tablename === 'blobs')) throw new Error('Not a Pebble database schema');
+  if (!tables.some(table => table.tablename === 'package_versions')) throw new Error('Not a Pebble database schema');
   const counts = [];
   for (const table of tables) {
     const count = (await database.query(`SELECT count(*)::text AS count FROM ${identifier(table.schemaname)}.${identifier(table.tablename)}`)).rows[0].count;
     counts.push({ schema: table.schemaname, table: table.tablename, count });
   }
-  const objects = (await database.query(`SELECT digest,byte_length::text AS byte_length FROM ${identifier(schema)}.blobs ORDER BY digest`)).rows.map(row => ({ digest: row.digest, byte_length: Number(row.byte_length) }));
+  // Every archive the database references: published files under the public tree and the
+  // private staging copies of candidates. Index files are derived from these rows and are
+  // regenerated with `reindex` after a restore; toolchain files are re-published by the operator.
+  const objects = (await database.query(`SELECT key,digest FROM (
+      SELECT 'public/packages/'||p.name||'/'||v.version||'/'||p.name||'-'||v.version||'.slatepkg' AS key, v.cksum AS digest FROM ${identifier(schema)}.package_versions v JOIN ${identifier(schema)}.packages p ON p.id=v.package_id
+      UNION ALL SELECT 'public/packages/'||p.name||'/'||v.version||'/'||p.name||'-'||v.version||'.interface', v.iface_cksum FROM ${identifier(schema)}.package_versions v JOIN ${identifier(schema)}.packages p ON p.id=v.package_id
+      UNION ALL SELECT 'staging/'||p.name||'/'||c.version||'/'||c.cksum||'.slatepkg', c.cksum FROM ${identifier(schema)}.candidates c JOIN ${identifier(schema)}.packages p ON p.id=c.package_id
+      UNION ALL SELECT 'staging/'||p.name||'/'||c.version||'/'||c.iface_cksum||'.interface', c.iface_cksum FROM ${identifier(schema)}.candidates c JOIN ${identifier(schema)}.packages p ON p.id=c.package_id
+    ) referenced GROUP BY key,digest ORDER BY key`)).rows.map(row => ({ key: row.key, digest: row.digest }));
   for (const object of objects) {
-    if (!HASH.test(object.digest) || !Number.isSafeInteger(object.byte_length) || object.byte_length < 0) throw new Error('Invalid database object reference');
+    if (!HASH.test(object.digest) || !/^(public|staging)\/[A-Za-z0-9_./-]{1,400}$/.test(object.key) || object.key.includes('..')) throw new Error('Invalid database object reference');
   }
   const settings = (await database.query(`SELECT registry_id,toolchain_digest,policy_digest FROM ${identifier(schema)}.registry_settings WHERE singleton`)).rows[0];
   if (!settings) throw new Error('Registry settings missing');
-  const snapshots = (await database.query(`SELECT digest AS snapshot_digest,
-    encode(sha256(convert_to(descriptor::text,'UTF8')),'hex') AS stored_json_sha256
-    FROM ${identifier(schema)}.snapshots ORDER BY digest`)).rows;
+  const candidates = (await database.query(`SELECT id AS candidate_id,cksum,iface_cksum,
+    encode(sha256(convert_to(manifest,'UTF8')),'hex') AS stored_manifest_sha256
+    FROM ${identifier(schema)}.candidates ORDER BY id`)).rows;
   const reports = (await database.query(`SELECT id AS attempt_id,report_digest,
-    encode(sha256(convert_to(report::text,'UTF8')),'hex') AS stored_json_sha256
+    encode(sha256(convert_to(coalesce(report::text,''),'UTF8')),'hex') AS stored_json_sha256
     FROM ${identifier(schema)}.verification_attempts ORDER BY id`)).rows;
-  // These are backup integrity hashes over stored PostgreSQL JSON text, not new
+  // These are backup integrity hashes over stored PostgreSQL text, not new
   // theorem/statement identities or a replacement for Slate verification.
-  return { tables: counts, objects, registry: settings, content_checks: { snapshots, reports } };
+  return { tables: counts, objects, registry: settings, content_checks: { candidates, reports } };
 }
 async function createBackup(directory, pgBin, schema) {
   if (!/^[a-z][a-z0-9_]{0,62}$/.test(schema)) throw new Error('Invalid --schema name');
@@ -151,8 +167,12 @@ async function createBackup(directory, pgBin, schema) {
     // The SQL rows and pg_dump share exactly one exported snapshot. Immutable
     // content-addressed objects can then be fetched without keeping MVCC open.
     await database.query('COMMIT');
-    for (const object of data.objects) await objectToFile(client, bucket, object, join(directory, 'objects', object.digest));
-    const manifest = { schema: 'Pebble.Backup.v1', database_snapshot_at: snapshotTime, completed_at: new Date().toISOString(),
+    const stored = new Set();
+    for (const object of data.objects) {
+      await objectToFile(client, bucket, object, join(directory, 'objects', object.digest), stored.has(object.digest));
+      stored.add(object.digest);
+    }
+    const manifest = { schema: 'Pebble.Backup.v2', database_snapshot_at: snapshotTime, completed_at: new Date().toISOString(),
       database_server_version_num: serverVersion, database_schema: schema, pg_dump_version: dumpVersion,
       dump: await fileHash(join(directory, 'database.dump')), ...data,
     };
@@ -161,7 +181,7 @@ async function createBackup(directory, pgBin, schema) {
     // Only this final file marks completion. Failed backups remain incomplete.
     await writeFile(join(directory, 'manifest.json'), bytes, { flag: 'wx', mode: 0o600 });
     return { status: 'backup_complete', archive: directory, manifest_sha256: sha(bytes),
-      objects: data.objects.length, object_bytes: data.objects.reduce((sum, object) => sum + object.byte_length, 0),
+      objects: data.objects.length, distinct_archives: stored.size, object_bytes: data.objects.reduce((sum, object) => sum + object.byte_length, 0),
       elapsed_ms: Date.now() - started };
   } finally { await database.end(); client.destroy(); }
 }
@@ -177,14 +197,15 @@ async function readArchive(directory, expectedDigest) {
   const bytes = await readFile(file);
   if (sha(bytes) !== expectedDigest) throw new Error('Backup manifest checksum mismatch');
   const manifest = JSON.parse(bytes);
-  if (manifest.schema !== 'Pebble.Backup.v1' || !Array.isArray(manifest.objects) || !Array.isArray(manifest.tables)
+  if (manifest.schema !== 'Pebble.Backup.v2' || !Array.isArray(manifest.objects) || !Array.isArray(manifest.tables)
       || !manifest.registry || !manifest.dump || !HASH.test(manifest.dump.sha256)
-      || !manifest.content_checks || !Array.isArray(manifest.content_checks.snapshots) || !Array.isArray(manifest.content_checks.reports)
+      || !manifest.content_checks || !Array.isArray(manifest.content_checks.candidates) || !Array.isArray(manifest.content_checks.reports)
       || !/^[a-z][a-z0-9_]{0,62}$/.test(manifest.database_schema)) throw new Error('Invalid backup manifest');
   let previous = '';
   for (const object of manifest.objects) {
-    if (!HASH.test(object.digest) || object.digest <= previous || !Number.isSafeInteger(object.byte_length) || object.byte_length < 0) throw new Error('Invalid backup object entry');
-    previous = object.digest;
+    if (!HASH.test(object.digest) || typeof object.key !== 'string' || object.key <= previous || !/^(public|staging)\/[A-Za-z0-9_./-]{1,400}$/.test(object.key) || object.key.includes('..')
+        || !Number.isSafeInteger(object.byte_length) || object.byte_length < 0) throw new Error('Invalid backup object entry');
+    previous = object.key;
     const actual = await fileHash(join(directory, 'objects', object.digest));
     if (actual.sha256 !== object.digest || actual.byte_length !== object.byte_length) throw new Error('Backup object checksum mismatch');
   }
@@ -198,10 +219,11 @@ async function verifyTargets(databaseUrl, bucket, manifest, client) {
     await database.connect();
     await database.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     const actual = await inventory(database, manifest.database_schema);
-    if (JSON.stringify(actual.tables) !== JSON.stringify(manifest.tables)
-        || JSON.stringify(actual.objects) !== JSON.stringify(manifest.objects)
-        || JSON.stringify(actual.registry) !== JSON.stringify(manifest.registry)
-        || JSON.stringify(actual.content_checks) !== JSON.stringify(manifest.content_checks)) throw new Error('Restored database inventory differs from backup');
+    const expectedObjects = manifest.objects.map(object => ({ key: object.key, digest: object.digest }));
+    for (const [name, restored, expected] of [['tables', actual.tables, manifest.tables], ['objects', actual.objects, expectedObjects],
+      ['registry', actual.registry, manifest.registry], ['content_checks', actual.content_checks, manifest.content_checks]]) {
+      if (JSON.stringify(restored) !== JSON.stringify(expected)) throw new Error(`Restored database inventory differs from backup: ${name}`);
+    }
     await database.query('COMMIT');
     for (const object of manifest.objects) await checkRemoteObject(client, bucket, object);
     const keys = [];
@@ -212,7 +234,7 @@ async function verifyTargets(databaseUrl, bucket, manifest, client) {
       token = page.IsTruncated ? page.NextContinuationToken : undefined;
       if (page.IsTruncated && !token) throw new Error('Incomplete restored bucket inventory');
     } while (token);
-    if (JSON.stringify(keys.sort()) !== JSON.stringify(manifest.objects.map(object => `objects/${object.digest}`))) throw new Error('Unexpected objects in restored bucket');
+    if (JSON.stringify(keys.sort()) !== JSON.stringify(manifest.objects.map(object => object.key))) throw new Error('Unexpected objects in restored bucket');
   } finally { await database.end(); }
 }
 async function restoreBackup(directory, expectedDigest, name, bucketPrefix, createTargets, pgBin) {
@@ -249,7 +271,7 @@ async function restoreBackup(directory, expectedDigest, name, bucketPrefix, crea
       ...(region === 'us-east-1' ? {} : { CreateBucketConfiguration: { LocationConstraint: region } }),
     }));
     for (const object of manifest.objects) {
-      await client.send(new PutObjectCommand({ Bucket: bucket, Key: `objects/${object.digest}`,
+      await client.send(new PutObjectCommand({ Bucket: bucket, Key: object.key,
         Body: createReadStream(join(directory, 'objects', object.digest)), ContentLength: object.byte_length,
         ChecksumSHA256: Buffer.from(object.digest, 'hex').toString('base64'), IfNoneMatch: '*',
       }));
@@ -260,9 +282,9 @@ async function restoreBackup(directory, expectedDigest, name, bucketPrefix, crea
     await verifyTargets(target.href, bucket, manifest, client);
     return { status: 'restored_verified', database: name, bucket, manifest_sha256: expectedDigest,
       database_schema: manifest.database_schema, objects: manifest.objects.length, tables: manifest.tables.length, elapsed_ms: Date.now() - started,
-      checked_snapshot_records: manifest.content_checks.snapshots.length, checked_report_records: manifest.content_checks.reports.length,
+      checked_candidate_records: manifest.content_checks.candidates.length, checked_report_records: manifest.content_checks.reports.length,
       access: 'quarantined_public_connect_revoked', serving: false,
-      next_step: 'Use a distinct runtime role; reconcile current permissions/revocations before explicitly granting CONNECT' };
+      next_step: 'Use a distinct runtime role; reconcile current permissions/revocations before explicitly granting CONNECT; then run the reindex command against the restored database and bucket to regenerate index/ and config.json' };
   } finally { await admin.end(); client.destroy(); }
 }
 

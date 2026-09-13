@@ -5,8 +5,9 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+const COMMANDS = ['serve', 'worker', 'migrate', 'reindex', 'provision', 'maintainer', 'transfer', 'invite', 'revoke-invite', 'toolchain-publish'];
 const command = process.argv[2];
-if (!['serve', 'worker', 'migrate', 'provision'].includes(command)) throw new Error('Usage: node deployment/local-cli.mjs serve|worker|migrate|provision [arguments]');
+if (!COMMANDS.includes(command)) throw new Error(`Usage: node deployment/local-cli.mjs ${COMMANDS.join('|')} [arguments]`);
 const directory = fileURLToPath(new URL('.', import.meta.url));
 const config = Object.fromEntries((await readFile(new URL('./local.env', import.meta.url), 'utf8')).split('\n')
   .filter(line => line && !line.startsWith('#')).map(line => {
@@ -17,9 +18,15 @@ const config = Object.fromEntries((await readFile(new URL('./local.env', import.
 for (const name of ['POSTGRES_PASSWORD', 'MINIO_PASSWORD', 'REGISTRY_ID', 'SLATE_TOOLCHAIN_DIR']) {
   if (!config[name]) throw new Error(`Missing ${name} in local.env`);
 }
+const port = config.PEBBLE_PORT || '3000';
 const env = { ...process.env,
-  NODE_ENV: 'development', HOST: '127.0.0.1', PORT: config.PEBBLE_PORT || '3000',
+  NODE_ENV: 'development', HOST: '127.0.0.1', PORT: port,
   REGISTRY_ID: config.REGISTRY_ID, SLATE_ROOTFS: resolve(directory, config.SLATE_TOOLCHAIN_DIR),
+  PEBBLE_TOOLCHAIN_TAG: config.PEBBLE_TOOLCHAIN_TAG || 'local',
+  // Loopback roots: the client accepts http://127.0.0.1 index roots for local work.
+  PEBBLE_INDEX_ROOT: `http://127.0.0.1:${port}/index/`,
+  PEBBLE_DL_TEMPLATE: `http://127.0.0.1:${port}/static/packages/{package}/{version}/{package}-{version}`,
+  PEBBLE_API_ROOT: `http://127.0.0.1:${port}/api/v1`,
   DATABASE_URL: `postgres://pebble:${encodeURIComponent(config.POSTGRES_PASSWORD)}@127.0.0.1:5432/pebble`,
   DB_POOL_SIZE: command === 'worker' ? '4' : '12',
   S3_ENDPOINT: 'http://127.0.0.1:9000', S3_REGION: 'us-east-1', S3_BUCKET: 'pebble',

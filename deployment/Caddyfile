@@ -2,23 +2,65 @@
 	email {$ACME_EMAIL}
 }
 
-{$PEBBLE_DOMAIN} {
+# Three public hosts, one API process: the sparse index, the immutable static
+# tree (archives and toolchains) and the write API. The client accepts only
+# https:// roots for these in production; local runs use the API port directly.
+
+(hardening) {
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options nosniff
 		Referrer-Policy same-origin
 		-Server
 	}
-	request_body {
-		max_size 50331648
-	}
+}
+
+(upstream) {
 	reverse_proxy api:3000 {
 		health_uri /health/ready
 		health_interval 10s
 		health_timeout 3s
 		transport http {
 			dial_timeout 3s
-			response_header_timeout 30s
+			response_header_timeout 120s
 		}
+	}
+}
+
+{$PEBBLE_INDEX_DOMAIN} {
+	import hardening
+	@read method GET HEAD
+	handle @read {
+		rewrite * /index{uri}
+		import upstream
+	}
+	handle {
+		respond 405
+	}
+}
+
+{$PEBBLE_STATIC_DOMAIN} {
+	import hardening
+	@read method GET HEAD
+	handle @read {
+		rewrite * /static{uri}
+		import upstream
+	}
+	handle {
+		respond 405
+	}
+}
+
+{$PEBBLE_API_DOMAIN} {
+	import hardening
+	request_body {
+		max_size 100663296
+	}
+	@api path /api/v1/* /health/*
+	handle @api {
+		import upstream
+	}
+	handle {
+		respond 404
 	}
 }

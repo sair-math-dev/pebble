@@ -9,6 +9,7 @@ const text = [
   'PEBBLE_PORT=3000',
   `REGISTRY_ID=${randomUUID()}`,
   'SLATE_TOOLCHAIN_DIR=./local/toolchain',
+  'PEBBLE_TOOLCHAIN_TAG=local',
 ].join('\n') + '\n';
 await writeFile(new URL('./local.env', import.meta.url), text, { flag: 'wx', mode: 0o600 });
 console.log('Created deployment/local.env without overwriting existing credentials.');

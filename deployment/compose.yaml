@@ -17,6 +17,10 @@ x-app: &app
     HOST: 0.0.0.0
     PORT: "3000"
     REGISTRY_ID: ${REGISTRY_ID:?Generate local.env}
+    PEBBLE_TOOLCHAIN_TAG: ${PEBBLE_TOOLCHAIN_TAG:-local}
+    PEBBLE_INDEX_ROOT: http://127.0.0.1:${PEBBLE_PORT:-3000}/index/
+    PEBBLE_DL_TEMPLATE: http://127.0.0.1:${PEBBLE_PORT:-3000}/static/packages/{package}/{version}/{package}-{version}
+    PEBBLE_API_ROOT: http://127.0.0.1:${PEBBLE_PORT:-3000}/api/v1
     SLATE_ROOTFS: /opt/slate
     DATABASE_URL: postgres://pebble:${POSTGRES_PASSWORD:?Generate local.env}@postgres:5432/pebble
     DB_POOL_SIZE: "10"

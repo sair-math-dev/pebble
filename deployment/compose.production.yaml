@@ -10,6 +10,11 @@ services:
       PORT: "3000"
       SLATE_ROOTFS: /opt/slate
       TRUST_PROXY_CIDRS: ${PEBBLE_EDGE_IP:-172.30.0.2}/32
+      PEBBLE_TOOLCHAIN_TAG: ${PEBBLE_TOOLCHAIN_TAG:?Set the toolchain tag this registry checks, e.g. 1.95.0}
+      # The roots written into index/config.json and the lock files of every consumer.
+      PEBBLE_INDEX_ROOT: https://${PEBBLE_INDEX_DOMAIN:?Set the index host}/
+      PEBBLE_DL_TEMPLATE: https://${PEBBLE_STATIC_DOMAIN:?Set the static host}/packages/{package}/{version}/{package}-{version}
+      PEBBLE_API_ROOT: https://${PEBBLE_API_DOMAIN:?Set the API host}/api/v1
     volumes:
       - ${SLATE_TOOLCHAIN_DIR:?Set the approved toolchain directory}/toolchain.json:/opt/slate/toolchain.json:ro
       - ${SLATE_TOOLCHAIN_DIR:?Set the approved toolchain directory}/digest.txt:/opt/slate/digest.txt:ro
@@ -33,7 +38,9 @@ services:
   edge:
     image: ${CADDY_IMAGE:?Run node deployment/pin-images.mjs first}
     environment:
-      PEBBLE_DOMAIN: ${PEBBLE_DOMAIN:?Set a domain whose DNS points to this host}
+      PEBBLE_INDEX_DOMAIN: ${PEBBLE_INDEX_DOMAIN:?Set the index host whose DNS points here}
+      PEBBLE_STATIC_DOMAIN: ${PEBBLE_STATIC_DOMAIN:?Set the static host whose DNS points here}
+      PEBBLE_API_DOMAIN: ${PEBBLE_API_DOMAIN:?Set the API host whose DNS points here}
       ACME_EMAIL: ${ACME_EMAIL:?Set the TLS certificate contact}
     ports: ["80:80", "443:443"]
     volumes:

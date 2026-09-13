@@ -1,5 +1,5 @@
 // Local Compose bootstrap only. Production bucket administration is separate.
-import { S3Client, HeadBucketCommand, CreateBucketCommand } from '@aws-sdk/client-s3';
+import { S3Client, HeadBucketCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
 
 const endpoint = new URL(process.env.S3_ENDPOINT || 'http://invalid');
 if (!['localhost', '127.0.0.1', 'minio'].includes(endpoint.hostname) || endpoint.protocol !== 'http:') {
@@ -21,5 +21,11 @@ try {
     if (creationError.name !== 'BucketAlreadyOwnedByYou') throw creationError;
   }
 }
-console.log('Local S3 bucket is ready.');
+// Only the `public/` prefix (index, archives, toolchains) is readable anonymously; staging
+// stays private. Production applies the equivalent policy through its own bucket administration.
+await client.send(new PutBucketPolicyCommand({ Bucket, Policy: JSON.stringify({
+  Version: '2012-10-17',
+  Statement: [{ Sid: 'PebblePublicTree', Effect: 'Allow', Principal: { AWS: ['*'] }, Action: ['s3:GetObject'], Resource: [`arn:aws:s3:::${Bucket}/public/*`] }],
+}) }));
+console.log('Local S3 bucket is ready; public/ is anonymously readable, staging/ is private.');
 client.destroy();
