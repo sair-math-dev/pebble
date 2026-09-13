@@ -1,0 +1,10 @@
+// A new fixture formalization of the classical group inverse-involution law.
+// SPDX-License-Identifier: Apache-2.0
+module Pebble.Fixtures.Algebra.Involution
+    under Pebble.Fixtures.Algebra.Group
+    import Pebble.Fixtures.Algebra.Inverses
+
+    theorem InverseInvolution(a : Element): inverse(inverse(a)) = a
+        a_is_right_inverse : inverse(a) * a = one from left_inverse(a)
+        canonical_inverse : a = inverse(inverse(a)) from Pebble.Fixtures.Algebra.Inverses.RightInverseUnique(inverse(a), a), a_is_right_inverse
+        inverse(inverse(a)) = a from canonical_inverse

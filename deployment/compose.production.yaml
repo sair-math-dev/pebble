@@ -1,0 +1,67 @@
+name: pebble
+services:
+  api:
+    image: ${PEBBLE_IMAGE:?Set an immutable registry image digest}
+    command: [serve]
+    env_file: [./production.api.env]
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      SLATE_ROOTFS: /opt/slate
+      TRUST_PROXY_CIDRS: ${PEBBLE_EDGE_IP:-172.30.0.2}/32
+    volumes:
+      - ${SLATE_TOOLCHAIN_DIR:?Set the approved toolchain directory}/toolchain.json:/opt/slate/toolchain.json:ro
+      - ${SLATE_TOOLCHAIN_DIR:?Set the approved toolchain directory}/digest.txt:/opt/slate/digest.txt:ro
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    expose: ["3000"]
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 128
+    stop_grace_period: 30s
+    networks:
+      ingress:
+        ipv4_address: ${PEBBLE_API_IP:-172.30.0.3}
+
+  # A portable single-host ingress. The initial HA deployment uses the same
+  # API image on two hosts behind a managed load balancer instead.
+  edge:
+    image: ${CADDY_IMAGE:?Run node deployment/pin-images.mjs first}
+    environment:
+      PEBBLE_DOMAIN: ${PEBBLE_DOMAIN:?Set a domain whose DNS points to this host}
+      ACME_EMAIL: ${ACME_EMAIL:?Set the TLS certificate contact}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 256m
+    pids_limit: 128
+    networks:
+      ingress:
+        ipv4_address: ${PEBBLE_EDGE_IP:-172.30.0.2}
+
+networks:
+  ingress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${PEBBLE_PRIVATE_SUBNET:-172.30.0.0/24}
+
+volumes:
+  caddy-data:
+  caddy-config:

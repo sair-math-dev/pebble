@@ -1,0 +1,18 @@
+// Adapted from Slate examples/algebra/{magma,monoid,group}.slate.
+// Changed for this fixture: combined the theory hierarchy and renamed its identity.
+// SPDX-License-Identifier: Apache-2.0
+sealed theory Pebble.Fixtures.Algebra.Group
+    logic Logic.ClassicalManySortedFOL.EID.v1
+
+    sort Element
+    function multiply(left : Element, right : Element) returns Element
+    constant one : Element
+    function inverse(value : Element) returns Element
+
+    notation "*" infix left precedence 70 : (Element, Element) -> Element maps Pebble.Fixtures.Algebra.Group.multiply
+
+    axiom associative : every x : Element: every y : Element: every z : Element: (x * y) * z = x * (y * z)
+    axiom left_identity : every x : Element: one * x = x
+    axiom right_identity : every x : Element: x * one = x
+    axiom left_inverse : every x : Element: inverse(x) * x = one
+    axiom right_inverse : every x : Element: x * inverse(x) = one

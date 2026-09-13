@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.artifacts/
+node_modules/
+.pebble/
+dist/

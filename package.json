@@ -1,0 +1,29 @@
+{
+  "name": "pebble-registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "tsc -p deployment/tsconfig.build.json",
+    "dev": "tsx src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "test:e2e": "tsx tests/registry-e2e.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1128.0",
+    "@fastify/helmet": "13.1.1",
+    "@fastify/rate-limit": "11.2.0",
+    "fastify": "5.12.3",
+    "pg": "8.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.0",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3"
+  }
+}

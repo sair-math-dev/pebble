@@ -1,0 +1,26 @@
+{
+  "schema": "Pebble.DeploymentImages.v1",
+  "resolved_at": "2026-09-09T08:32:24.439Z",
+  "images": {
+    "NODE_IMAGE": {
+      "source": "docker.io/library/node:24-bookworm-slim",
+      "digest": "sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e",
+      "reference": "docker.io/library/node@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e"
+    },
+    "POSTGRES_IMAGE": {
+      "source": "docker.io/library/postgres:17-bookworm",
+      "digest": "sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0",
+      "reference": "docker.io/library/postgres@sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0"
+    },
+    "CADDY_IMAGE": {
+      "source": "docker.io/library/caddy:2-alpine",
+      "digest": "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648",
+      "reference": "docker.io/library/caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+    },
+    "MINIO_IMAGE": {
+      "source": "docker.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+      "digest": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "reference": "docker.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+// A fixture formalization of equality substitution for membership.
+// SPDX-License-Identifier: Apache-2.0
+module Pebble.Fixtures.Sets.Transport
+    under Pebble.Fixtures.Sets.Membership
+
+    theorem MembershipPreserved(element : Set, left : Set, right : Set): left = right -> member(element, left) -> member(element, right)
+        (same_container : left = right) =>
+            (membership : member(element, left)) =>
+                member(element, right) from same_container, membership

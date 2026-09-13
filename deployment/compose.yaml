@@ -1,0 +1,95 @@
+name: pebble-local
+
+x-app: &app
+  image: ${PEBBLE_IMAGE:-pebble:local}
+  build:
+    context: ..
+    target: api
+    args:
+      NODE_IMAGE: ${NODE_IMAGE:?Run node deployment/pin-images.mjs first}
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+  environment: &environment
+    NODE_ENV: development
+    HOST: 0.0.0.0
+    PORT: "3000"
+    REGISTRY_ID: ${REGISTRY_ID:?Generate local.env}
+    SLATE_ROOTFS: /opt/slate
+    DATABASE_URL: postgres://pebble:${POSTGRES_PASSWORD:?Generate local.env}@postgres:5432/pebble
+    DB_POOL_SIZE: "10"
+    S3_ENDPOINT: http://minio:9000
+    S3_REGION: us-east-1
+    S3_BUCKET: pebble
+    S3_FORCE_PATH_STYLE: "true"
+    AWS_ACCESS_KEY_ID: pebble-local
+    AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:?Generate local.env}
+  volumes:
+    - ${SLATE_TOOLCHAIN_DIR:?Set the generated toolchain directory}/toolchain.json:/opt/slate/toolchain.json:ro
+    - ${SLATE_TOOLCHAIN_DIR:?Set the generated toolchain directory}/digest.txt:/opt/slate/digest.txt:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_started
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?Run node deployment/pin-images.mjs first}
+    environment:
+      POSTGRES_USER: pebble
+      POSTGRES_DB: pebble
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate local.env}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U pebble -d pebble"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 1g
+    pids_limit: 128
+
+  # Archived MinIO image is intentionally confined to localhost development.
+  minio:
+    image: ${MINIO_IMAGE:?Run node deployment/pin-images.mjs first}
+    command: [server, /data, --console-address, ":9001"]
+    environment:
+      MINIO_ROOT_USER: pebble-local
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:?Generate local.env}
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    volumes: [minio:/data]
+    mem_limit: 1g
+    pids_limit: 128
+
+  migrate:
+    <<: *app
+    profiles: [ops]
+    command: [migrate]
+    healthcheck:
+      disable: true
+
+  storage-init:
+    <<: *app
+    profiles: [ops]
+    entrypoint: [node, deployment/init-storage.mjs]
+    command: []
+    volumes:
+      - ./init-storage.mjs:/app/deployment/init-storage.mjs:ro
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *app
+    command: [serve]
+    ports: ["127.0.0.1:${PEBBLE_PORT:-3000}:3000"]
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    stop_grace_period: 30s
+
+volumes:
+  postgres:
+  minio:

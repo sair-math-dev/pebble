@@ -2,9 +2,9 @@
 
 记录：TECH-0002；状态：proposed；研究日期：2026-09-08。
 
-当前核心方向：Cargo 式的本地包管理与构建检查，Pebble 提供注册分发、验证发布及 GitHub 风格的包浏览。完整 Git 托管不作为前置条件。
+当前核心方向：以完整 Git 仓库保存研究源码版本，Slate 提供 Cargo 式本地包管理与检查，Pebble 提供仓库托管、注册分发及验证发布。clone/fetch/push、历史、分支和标签是核心能力；包快照从固定 commit 导出。
 
-本文件是可供下一步实现讨论的协议草案，不是现有 Slate 命令或已接受的持久格式。平台架构见 [技术研究](technical-research.md)。
+本文件包含协议提案和第 9 节的迁移前实测进展，不是全部已经实现的持久契约。当前运行代码、数据库 schema 和部署配置尚无 Git 托管及 commit→snapshot 绑定；本轮只修订架构约定，尚未开始 Git 实现。平台架构见 [技术研究](technical-research.md)。
 
 ## 1. 对当前 Slate 的实际核查
 
@@ -51,8 +51,8 @@ Cargo 将命令划分为构建、清单、包、发布和报告等类别，并�
 | `slate build` | 根据精确工作区图构建产物，复用合法缓存；build 成功不等于所有程序都已证明正确 |
 | `slate check` | 执行所选包检查目标，输出覆盖范围、精确结果、假设和未解决项 |
 | `slate run` | 选择可执行目标并运行，保持现有 ordinary execution 与证明检查的区别 |
-| `slate package` | 检查清单、枚举将上传的文件、生成不可变快照；可离线预览包内容 |
-| `slate publish` | 上传同一快照，触发正式检查/审核，查询完成状态；可幂等重试 |
+| `slate package` | 从精确 Git commit 的包路径检查清单并导出不可变快照；可离线预览包内容 |
+| `slate publish` | 提交仓库、精确 commit、包路径及对应导出快照，触发检查/审核；可幂等重试 |
 | `slate search / info / tree / metadata` | 搜索包、查看版本与安装信息、解释依赖图、向 IDE/agent 输出结构化工作区 |
 
 `--locked` 禁止隐式改锁，缺锁或清单不一致直接失败；`--offline` 禁止网络，缺依赖明确报错；普通重复构建优先沿用已有锁，不自行追最新版。缓存可复用，但键需绑定源内容、依赖、工具链及相关检查配置。
@@ -61,7 +61,7 @@ Workspace 支持多个成员共享一个求解结果及锁文件，并可选择�
 
 `test`、文档生成和类似 `cargo install` 的可执行工具安装需要分别定义目标模型，后续加入；有限输入测试通过不能冒充定理证明，当前不为了命令表完整而造假的验证状态。自动执行 build scripts、插件或可执行清单也不是采用 Cargo 风格所必需的功能。
 
-网页采用 GitHub 熟悉的导航，但详情首页优先展示 Research card：学术标题、作者、问题、结论、假设、精确引用和使用示例；owner/name、源码树、版本与侧栏安装命令作为配套。包版本是默认浏览基线，源码直接来自对应发布快照；无需先创建远程 Git 仓库才可发布、安装或浏览一个引理包。结果拥有独立引用落点，分发仍以包为单位。
+网页采用 GitHub 熟悉的导航，但详情首页优先展示 Research card：学术标题、作者、问题、结论、假设、精确引用和使用示例；owner/name、源码树、版本与侧栏安装命令作为配套。包版本是默认浏览基线，源码和交付快照来自对应仓库的精确 commit；一个引理包也通过相同的 Git 版本与发布流程。结果拥有独立引用落点，分发仍以包为单位。
 
 ### A. 作者清单：意图
 
@@ -88,7 +88,7 @@ algebra = { package = "@example/algebra", version = "^0.2.0" }
 
 依赖 alias 仅供清单使用，不自动重命名 Slate 的 ModuleId。工具链选择由独立受控 toolchain descriptor 锁定，锁文件记录其摘要。理论文件与标准库也是精确内容依赖，不能从运行机器的任意安装位置取到“差不多一样”的版本。
 
-源码 roots 是作者提出的包边界，不是验证覆盖的最终依据。最终发布内容由服务器从上传的固定包快照枚举（如果从 Git 导入，则先固定 tree 并物化为同一种快照），所有形式化源码均进入工具链清单；作者少写一个 root、用 ignore 排除坏定理不能得到正式发布。未支持的形式化内容使发布候选保持未就绪，并列出文件。
+源码 roots 是作者提出的包边界，不是验证覆盖的最终依据。最终发布内容由服务器从已固定 Git commit 的完整源码树及明确包范围导出和枚举，所有形式化源码均进入工具链清单；作者少写一个 root、用 ignore 排除坏定理不能得到正式发布。未支持的形式化内容使发布候选保持未就绪，并列出文件。
 
 ### B. 发布输入清单：固定内容
 
@@ -98,15 +98,16 @@ algebra = { package = "@example/algebra", version = "^0.2.0" }
 | --- | --- |
 | `schema` | 该分发格式版本；未知格式拒绝 |
 | `package_id`, `version` | 注册服务的稳定包身份与版本，不以 slug 当身份 |
+| `source_revision` | 稳定 `repo_id`、精确 commit、必要的包路径；与实际导出内容核对，不使用可变分支或标签 |
 | `source_files[]` | 精确相对路径、文件类型/模式、长度、SHA-256 |
 | `data_objects[]` | 必需数据的逻辑名称、长度、摘要、媒体类型；下载位置不作为内容身份 |
-| `dependency_lock` | 直接依赖及完整可达图的稳定包 ID、版本、快照摘要、注册来源 |
+| `dependency_lock` | 直接依赖及完整可达图的包 ID、版本、仓库 ID、精确 commit、包路径、快照摘要和注册来源 |
 | `toolchain_digest` | 可获取的精确工具链描述，不是人类可变标签 |
 | `manifest_digest`, `research_metadata_digest` | 作者清单原始 bytes 与正式说明/作者/许可证快照 |
 
-`snapshot_digest = SHA256(domain || canonical_snapshot)`；snapshot 不包含自己的摘要或将来的验证输出，避免 hash cycle。清单自身作为协议对象存储，不递归列入自己的 `source_files`。Git OID 单独作为来源记录，源码发布内容可以跨仓库保持相同内容身份。
+`snapshot_digest = SHA256(domain || canonical_snapshot)`；snapshot 不包含自己的摘要或将来的验证输出，避免 hash cycle。清单自身作为协议对象存储，不递归列入自己的 `source_files`。Git commit 与派生快照保持明确绑定，不能把外部 URL 当作该绑定的替代。导出发生在 commit 形成后；提交文件不包含自身 commit OID 或未来快照摘要，避免循环。相同文件 bytes 可共享存储，但不同仓库的发布、引用和署名不因此合并。
 
-生成的依赖锁只记录外部/先行依赖的快照摘要，不记录当前根包自己的 snapshot digest。多包发布先按无环依赖顺序确定快照，发布集合 ID 再绑定全部快照；任何快照都不反向引用该集合 ID。
+提交内的依赖锁只记录已固定的外部依赖；同仓库成员按包路径关联，共同 commit 由提交外的发布绑定补齐。不能把本仓库 commit 或依赖该 commit 的快照摘要写回该 commit 的文件。多包导出按无环依赖顺序确定快照，发布集合再绑定全部快照；任何快照都不反向引用该集合 ID。
 
 建议 canonical_snapshot 使用 RFC 8785 JCS，限制数值为非负安全整数，摘要为固定小写 hex，数组按协议规定顺序排序；拒绝重复键、未知必需字段、非规范路径。JCS 本身不做 Unicode 归一化，因此路径规则要在编码之前验证，不能在下载后悄悄改名。[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)。
 
@@ -114,7 +115,7 @@ algebra = { package = "@example/algebra", version = "^0.2.0" }
 
 ### C. 检查报告与发布记录：结果
 
-验证输出不写回 PackageSnapshot，而通过外层 `VerificationRun` 绑定 input digest。发布对象再绑定 snapshot 与检查记录，并带审核记录；不会改变包内容。
+验证输出不写回 PackageSnapshot，而通过外层 `VerificationRun` 绑定 input digest。发布对象固定仓库、commit、包路径、派生 snapshot 与检查及审核记录；后续分支修改生成新 commit，不能覆写旧 release 或引用内容。
 
 建议报告至少包含：
 
@@ -142,7 +143,7 @@ program_contracts[]:
 
 ## 4. 依赖解析：先明确可接受图，再选择算法
 
-首版建议每个完整发布闭包中一个 package ID 只有一个版本，同一个 Slate ModuleId 只有一个来源。构建图必须无环。registry metadata 宣称的 exports 仅用于提前报错，最终由工具链重新发现和确认。
+首版建议每个完整发布闭包中一个 package ID 只有一个版本，同一个 Slate ModuleId 只有一个来源。同一 `repo_id` 统一固定一个 commit，并对该版本的源码整体检查；不能按每条定理最后修改的 commit 拼装源码，仓库内多个包也不能偷偷混用不同 commit。包构建图必须无环，Git 提交历史另行保存。registry metadata 宣称的 exports 仅用于提前报错，最终由工具链重新发现和确认。
 
 **正式包版本固定它验证时的传递依赖闭包。** 作者清单允许范围，是解析输入；生成的发布清单保留准确选择。消费已发布包时不可偷偷重新解析它的内部依赖再沿用旧验证身份。替换内部依赖需要重新验证，并形成新的发布绑定。
 
@@ -150,9 +151,9 @@ program_contracts[]:
 
 依赖算法可采用 Rust PubGrub，实现 package/version 约束求解和冲突解释；各发布版本的固定直接依赖作为精确约束，其传递闭包由此展开。先检测/约束 package 和 ModuleId 冲突，再调用 Slate 检查实际图；求解器没有数学权威。[PubGrub Rust 实现](https://github.com/pubgrub-rs/pubgrub)。
 
-锁文件按 registry identity + package ID 固定来源，不跨 registry 自动寻找同名替代包，避免依赖混淆。完整图下载按拓扑调度并去重，图验证成本按 `V+E` 计，版本求解另计回溯复杂度。第一次可按包读取并缓存索引，不需要下载全站索引。
+锁文件按 registry identity、package ID、稳定 repo ID、精确 commit 及包路径固定来源，不跨 registry 自动寻找同名替代包，也不在安装时追踪 `main` 或标签的新位置。完整图下载按拓扑调度并去重，图验证成本按 `V+E` 计，版本求解另计回溯复杂度。第一次可按包读取并缓存索引，不需要下载全站索引。
 
-开发允许 path 或 Git commit 依赖，但正式发布要转换为明确可获得的固定包/物化内容，拒绝分支标签、工作树脏改动和未锁定的来源。用户 credentials 存在系统凭据存储，不进入清单、lock 或 Git。
+开发工作树可以修改，但正式发布及依赖必须绑定可获得的精确 Git commit 与核对过的导出内容，拒绝可变分支/标签、未提交改动和未锁定来源。用户 credentials 存在系统凭据存储，不进入清单、lock 或 Git。
 
 ## 5. 本地缓存与远端内容严格分开
 
@@ -171,7 +172,7 @@ program_contracts[]:
 
 平台的 `FormalChecksPassed` 是发布 gate 的结果，不是新增 Slate 定理状态。条件必须同时满足：
 
-1. 包内容全部物化，清单和实际文件/数据一致，依赖版本可取得且符合当前发布政策。
+1. 仓库、精确 commit、包路径及导出快照绑定一致；包内容全部物化，清单和实际文件/数据一致，依赖版本可取得且符合当前发布政策。
 2. 工具链分类完整，所有形式化源码都有明确处理结果；没有漏文件、未解决义务、开发假设或不支持内容。
 3. theorem 的精确目标通过已有检查路径；axiom、schema、理论假设全部显式披露。不能要求所有假设为空，也不能把声明 axiom 等同于证明 theorem。
 4. 需要程序正确性验证的内容有精确 owner contract 的既有 ProgramCert 检查结果；普通 `Executed` 不能作为替代。
@@ -191,7 +192,7 @@ program_contracts[]:
 | --- | --- | --- |
 | `GET /api/v1/packages/{id}/versions` | 包版本、snapshot digest、撤回/撤销状态、ETag | 私有索引也鉴权，分页稳定排序 |
 | `GET /api/v1/packages/{id}/versions/{version}` | 固定清单及当前状态引用 | 内容身份稳定；状态可以追加变化 |
-| `POST /api/v1/projects/{id}/release-candidates` | snapshot digest、包集合、可选 Git 来源、expected project revision | 返回 202 + candidate ID；同幂等键换请求体返回 409 |
+| `POST /api/v1/projects/{id}/release-candidates` | repo ID、精确 commit、包路径、对应 snapshot digest、expected project revision | 返回 202 + candidate ID；同幂等键换请求体返回 409 |
 | `GET /api/v1/release-candidates/{id}` | 当前阶段、检查与审核记录、失败原因 | 失败阶段可诊断，不把 Timeout 显示为 False |
 | `POST /api/v1/release-candidates/{id}/publish` | If-Match 候选修订、幂等键 | 检查输入不变且当前 gate 通过，事务提交全部包 |
 | `POST /api/v1/releases/{id}/withdrawals` | 原因、替代发布引用 | 原版本不覆写，记录调用者权限 |
@@ -206,13 +207,23 @@ CLI 面向用户建议 `slate init/add/update/build/check/publish`，但具体�
 
 | Slate 仓库 | Pebble 仓库 |
 | --- | --- |
-| 包清单/锁文件、resolver、安装布局 | 注册 namespace、不可变版本和下载 |
-| 完整源清单与声明分类 | 固定发布候选和元数据审核 |
+| 包清单/锁文件、resolver、安装布局 | Git 仓库及当前 ACL、注册 namespace、不可变版本和下载 |
+| 完整源清单与声明分类 | commit→snapshot 绑定、固定发布候选和元数据审核 |
 | 工具链自身的结构化检查输出 | Worker 协调、报告关联与发布事务 |
 | 现有内核、源重建、证据重放和本地缓存 | 页面、精确引用、搜索、权限和撤回 |
 
 首个真实样例选一个小型代数理论/定理包，第二个项目导入它证明一个新结果；另用集合论包检验理论环境差异。首次分发不以全量 mathlib 迁移作为前置条件，也不声称已有能力替代 mathlib。
 
-必须演示：同内容重定位身份一致；漏掉一个坏文件不能通过 coverage；替换依赖后旧证据不适用；同名模块不同版本明确拒绝；下载缓存不能伪造本地来源；`ProvedStatement` 开发假设不能通过发布；超时与基础设施失败保持未解决；两个发布者争同一版本只有一个事务提交；撤销后新解析不能无提示选中该版本。
+必须演示：真实 clone/fetch/push、分支、标签与历史；发布绑定 commit 不随 ref 变化；服务端普通删仓并回收开发存储后干净客户端仍可从发布档案复用；删除与发布并发及同名重建不能破坏旧引用；私有档案撤权后拒绝读取；同仓库不同 commit 混装拒绝；同内容重定位身份一致；漏掉一个坏文件不能通过 coverage；替换依赖后旧证据不适用；同名模块不同版本明确拒绝；下载缓存不能伪造本地来源；`ProvedStatement` 开发假设不能通过发布；超时与基础设施失败保持未解决；两个发布者争同一版本只有一个事务提交；撤销后新解析不能无提示选中该版本。
 
-本轮尚未实现这些接口。最先需要落地的是 Slate 的“完整包清单 + 结构化检查报告”适配实验，它决定真实发布 gate 能支持哪些内容；数据库表和 UI 可以并行开发，但不能用模拟绿灯填补这个缺口。
+上文包含早期提案命令和接口，不代表全部已经实现。2026-09-09 迁移前已完成的快照注册、锁文件与发布接口见 [实施契约](registry-protocol.md)，其中采用精确稳定版本选择、单包原子发布与源码下载重建；这些接口尚未实现 Git 仓库和 commit 绑定。尚未实现的版本范围、多包联合发布、结果 API 等不能从提案表推断为可用。
+
+## 9. 迁移前快照闭环实测（2026-09-09）
+
+[接入实验](../experiments/README.md) 已开始实现，Slate 改动在独立 `integrate/pebble-package-report` 分支，基线仍是 `bab9a76e7864c33e4a90ec6f1b41ba972920d4bf`。此前第 1 节是该基线的历史源码核查，不代表新增接口已经进入上游 main。
+
+新增 `slatec check-package ROOT` 通过 Slate 自身 parser 枚举声明，复用原模块编译和定理检查路径，直接导出 JSON；Pebble 对固定源码快照进行本地转移、在新目录重建，并关联原始报告。它支持检查当前目录中的理论/定理源码，不支持的形式化内容保持未完成，不从普通执行或 stdout 字符串推断已证明。
+
+迁移前已加入 Slate `tools/slate` Rust 客户端、`slate.toml`、生成的精确 `slate.lock` 和 HTTP 获取/检查；Pebble 已实现 PostgreSQL/S3 注册服务、明确研究元数据审核、只读固定 rootfs 中的隔离 worker、租约回传及原子发布。三个真实包完成 HTTP 发布，其中代数消费者在发布者本地目录删除后从服务取得依赖并检查新的逆元对合定理。该验收未经过 Git clone/push 或 commit→snapshot 路径，不能证明修订后的 Git 闭环已实现。具体证据与可复现命令见 [实施记录](implementation-status.md)。
+
+Slate 报告的 `complete` 描述完整源码检查，新增 `formal_checks_eligible` 与明确的 `source_check_policy` 表达 Slate 自身支持的形式化资格；`report_scope=source_only`、`publication_status=not_published` 和 `release_eligible=false` 保持不变。Pebble 在固定输入、完整原生报告与当前政策之外，再独立检查权限、审核、依赖状态、候选修订和版本唯一性，只有发布事务提交后才产生正式版本。全局定理索引和 Web 结果展示仍未实现。

@@ -1,0 +1,5 @@
+*.env
+local/
+secrets/
+backups/
+load-results/
