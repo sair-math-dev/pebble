@@ -1,4 +1,20 @@
-# 首个注册、验证与复用闭环
+# 注册、验证与复用闭环
+
+## 2026-09-12：迁移到 ADR-0188 协议
+
+服务端按 Slate 仓库已实现的客户端契约重写（分支 `feature/adr-0188-protocol`，起点 `83931a2`）：包按名字发布，UUID 快照 API、`Pebble.PackageSnapshot` 与 blob 封装全部移除；`PUT /api/v1/packages/new` 逐字段接受客户端的发布体，服务端校验清单、版本、前缀与依赖，把 `.slatepkg`/`.interface` 按内容寻址私有暂存；worker 在 bubblewrap 内对物化的 `file://` 镜像运行冻结的 `slate check --release --slatec /slatec`，要求 `complete=true`，把产生的接口与上传接口及随附对象逐字节比对，再与上一正式版本比较计算变更级别；通过后进入社区审核，维护者组织直接发布；发布写入 `public/packages/...` 与 cargo 路径的索引行，`config.json` 由环境变量给出的三个根生成；撤回/取消撤回只改写索引行；`GET /index/*` 与 `GET /static/*` 由 API 进程只读服务；命名空间前缀首发即有、子前缀仅可明确让出、`Std./Math./Slate.` 保留；迁移 003 替换旧表并拒绝旧 schema 启动。契约细节见 [registry-protocol.md](registry-protocol.md)。
+
+验证（Node v20.19.4，本机 PostgreSQL 17 与 MinIO 直接运行，Docker 不可用）：`npm run typecheck`、`npm run build` 通过；`npm test` 25/25 通过、0 跳过（协议单元测试、真实 PostgreSQL/S3/沙箱的注册表不变量、邀请注册、隔离探针、HTTP 准入与限流），日志 `.artifacts/logs/npm-test-full.log`。`npm run test:e2e` 通过，日志 `.artifacts/logs/e2e-2.log`，产物 `.artifacts/registry-e2e-2026-09-13T00-52-39-606Z/`（UTC）。该 e2e 用真实 `slate` 二进制对监听 `127.0.0.1` 的 Fastify 实例执行：`slate publish` 发布 `base 0.1.0`（`SLATE_TOKEN` 鉴权，无 Idempotency-Key）→ worker `runOne` 在沙箱复检通过 → 审核者经 `POST /candidates/{id}/review` 批准 → 索引行出现；删除发布者目录与 `SLATE_HOME` 后，消费者 `app`（`base = "^0.1"`）`slate check` 得到 `mode=development, dev_mode=true`，`base` 模块 `loaded_from_trusted_cache`；`slate check --release` 从源码重放，锁文件记录 `registry+http://127.0.0.1...`；`app` 自身 `slate publish` 经 worker 的离线镜像解析依赖并通过；`slate yank base@0.1.0` 后 `slate update` 在既有锁上无变化、新项目 `slate update` 得到 `NoVersionSatisfiesRequirements`，`--undo` 恢复；`base 0.2.0` 改写定理陈述，客户端以 `--level patch` 发布被本地拒绝（`DeclaredLevelBelowComputed`），用客户端 `--dry-run` 产物构造声明 `patch` 的请求直接上传后，worker 计算 major 并把候选置为 `rejected`，诊断含 `Acme.Base.Core.Core statement changed`，`public/` 树与索引均无 0.2.0。
+
+备份脚本移植到新表与键布局，并在本地完成备份→恢复→`reindex` 演练（见 [deployment.md](deployment.md#6-备份恢复与状态撤销)）。新增 `deployment/deploy.sh`（参数化 ssh/rsync/compose，未执行）。
+
+客户端契约核对中发现两处需要 Slate 侧关注：(1) 开发模式检查把依赖的 statements-only 对象安装进 `.slate/cache/objects` 后，同一目录随后的 `--release` 检查以 `ModuleProofUnavailable` 失败而不是回退到源码重建，e2e 在发布检查前清空 `.slate/` 规避；(2) 编译器拒绝 `Std.` 下的源码理论（`ReservedSourceTheoryIdentity`），因此保留前缀只能作为清单里的前缀声明到达注册表，注册表按此拒绝。另一处是运维事实而非契约问题：worker rootfs 冻结的 `slatec` 与消费者使用的 `slatec` 必须是同一构建，否则 `checker_frontend_hash` 与模块对象哈希不同，注册表以 `InterfaceMismatch` 拒绝——这正是接口比对应有的行为。
+
+尚未实现：容量探针（旧 API 的 `tests/capacity-probe.ts` 已删除，未针对索引/静态读取重写）；依赖闭包物化总量上限；跨副本限流与账户配额；网页与全局定理 DAG。未部署公网、未推送。
+
+## 2026-09-09：首个快照注册闭环（历史）
+
+以下为迁移前快照协议的记录，其中的端点、表与容量探针已被上文替代。
 
 记录日期：2026-09-09。以下区分实际运行结果和待上线验证的配置；源码改动尚未提交、推送或合并。
 
@@ -62,10 +78,9 @@ export SLATEC=/absolute/path/to/slatec
 npm run typecheck
 npm test
 npm run test:e2e
-npx tsx tests/capacity-probe.ts
 ```
 
-环境文件未提供时，`npm test` 的基础设施集成部分明确跳过；E2E 与容量脚本则失败退出，不能把未执行的检查计为成功。隔离测试要求 Linux、C 编译器和非特权 user namespace。测试产物写入被 Git 忽略的 `.artifacts/`；其中实际研究内容和检查报告需按数据权限管理，凭据不写入摘要或测量报告。
+当前命令为 `node dist/main.js toolchain --slatec ... --slate ... --output ...`，并需要 `PEBBLE_TOOLCHAIN_TAG`；测试默认标签 `local`。环境文件未提供时，`npm test` 的基础设施集成部分明确跳过；E2E 则失败退出，不能把未执行的检查计为成功。隔离测试要求 Linux、C 编译器和非特权 user namespace。测试产物写入被 Git 忽略的 `.artifacts/`；其中实际研究内容和检查报告需按数据权限管理，凭据不写入摘要或测量报告。
 
 ## 当前边界
 
