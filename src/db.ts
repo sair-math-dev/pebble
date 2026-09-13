@@ -28,7 +28,7 @@ export class Database {
   }
 
   async migrate() {
-    const migrations = await Promise.all(['001_registry.sql', '002_invitations.sql'].map(name =>
+    const migrations = await Promise.all(['001_registry.sql', '002_invitations.sql', '003_named_packages.sql'].map(name =>
       readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8')));
     await this.transaction(async db => {
       // Only schema installation is serialized globally; ordinary requests and
